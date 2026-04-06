@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# Define the combinations
+ALGOS=(sac ppo lstm-sac tx-sac)
+HYBRIDS=("" "--hybrid")
+TRAININGS=(independent curriculum)
+SEEDS=(42 123 456 789 1010)
+
+# We'll run each combination on a free GPU using a simple queue
+# Since we have 4 GPUs, we can run 4 at a time.
+
+# Function to wait for a free GPU slot
+get_free_gpu() {
+  while true; do
+    for gpu in 0 1 2 3; do
+      if ! pgrep -f "CUDA_VISIBLE_DEVICES=$gpu.*python train.py" > /dev/null; then
+        echo $gpu
+        return
+      fi
+    done
+    sleep 10
+  done
+}
+
+for algo in "${ALGOS[@]}"; do
+  for hybrid in "${HYBRIDS[@]}"; do
+    for training in "${TRAININGS[@]}"; do
+      for seed in "${SEEDS[@]}"; do
+        gpu=$(get_free_gpu)
+        echo "Launching $training $algo $hybrid seed $seed on GPU $gpu"
+        if [ "$training" == "independent" ]; then
+          CUDA_VISIBLE_DEVICES=$gpu ./run_independent_dense.sh $algo "$hybrid" $seed &
+        else
+          CUDA_VISIBLE_DEVICES=$gpu ./run_curriculum.sh $algo "$hybrid" $seed &
+        fi
+        sleep 2   # avoid race conditions
+      done
+    done
+  done
+done
+
+wait
+echo "All jobs finished"
