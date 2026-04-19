@@ -1,0 +1,219 @@
+# FULL CORRECTED TRAIN.PY
+# (clean, tuned, curriculum-ready)
+
+import argparse
+import random
+import numpy as np
+import torch
+import os
+import gym
+from stable_baselines3 import SAC, PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import EvalCallback
+from env import make_env
+from env.observation_wrapper import TemporalObservationWrapper
+from config import OBSERVATION_HISTORY, NUM_LIDAR
+
+# ------------------------------------------------------------
+# Gym Wrapper
+# ------------------------------------------------------------
+class GymWrapper(gym.Env):
+    def __init__(self, hybrid=False, seed=None):
+        super().__init__()
+        self.env = make_env(hybrid)
+        self.hybrid = hybrid
+
+        if hybrid:
+            low = np.array([0.0] * NUM_LIDAR + [-1.0, -1.0, -1.0])
+            high = np.array([1.0] * NUM_LIDAR + [1.0, 1.0, 1.0])
+            self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        else:
+            self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(NUM_LIDAR,), dtype=np.float32)
+
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        obs = self.env.reset()
+        return obs, {}
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        return obs, reward, done, False, info
+
+# ------------------------------------------------------------
+# Subproc factory
+# ------------------------------------------------------------
+def make_env_fn(hybrid, seed, rank, algorithm, history_len):
+    def _init():
+        random.seed(seed + rank)
+        np.random.seed(seed + rank)
+        env = GymWrapper(hybrid=hybrid)
+        if algorithm in ['lstm-sac', 'tx-sac']:
+            env = TemporalObservationWrapper(env, history_len=history_len)
+        return env
+    return _init
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--env_type', type=str, default='mixed')
+    parser.add_argument('--algorithm', type=str, default='sac')
+    parser.add_argument('--hybrid', action='store_true')
+    parser.add_argument('--total_timesteps', type=int, default=500000)
+    parser.add_argument('--eval_freq', type=int, default=10000)
+    parser.add_argument('--gui', action='store_true')
+    parser.add_argument('--gpu', action='store_true')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--num_envs', type=int, default=1)
+    parser.add_argument('--pretrained', type=str, default=None)
+    parser.add_argument('--exp_suffix', type=str, default='')
+    return parser.parse_args()
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+def main():
+    args = parse_args()
+    device = torch.device('cuda' if args.gpu and torch.cuda.is_available() else 'cpu')
+    set_seed(args.seed)
+
+    import config
+    config.ENV_TYPE = args.env_type
+    config.GUI = False
+
+    # ---------------- ENV CREATION ----------------
+    if args.num_envs > 1:
+        env_fns = [make_env_fn(args.hybrid, args.seed, i, args.algorithm, OBSERVATION_HISTORY)
+                   for i in range(args.num_envs)]
+        env = SubprocVecEnv(env_fns)
+    else:
+        env = GymWrapper(hybrid=args.hybrid, seed=args.seed)
+        if args.algorithm in ['lstm-sac', 'tx-sac']:
+            env = TemporalObservationWrapper(env, history_len=OBSERVATION_HISTORY)
+        env = DummyVecEnv([lambda: env])
+
+    env = VecNormalize(env, norm_obs=True, norm_reward=True)
+
+    # ---------------- EVAL ENV ----------------
+    eval_env = GymWrapper(hybrid=args.hybrid, seed=args.seed + 1000)
+    if args.algorithm in ['lstm-sac', 'tx-sac']:
+        eval_env = TemporalObservationWrapper(eval_env, history_len=OBSERVATION_HISTORY)
+    eval_env = DummyVecEnv([lambda: eval_env])
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+
+    # ---------------- POLICY KWARGS ----------------
+    actual_obs_dim = NUM_LIDAR + 3 if args.hybrid else NUM_LIDAR
+    policy_kwargs = None
+
+
+    model_name = f'{args.env_type}_{args.algorithm}_{"hybrid" if args.hybrid else "end2end"}_seed{args.seed}_{args.exp_suffix}'
+
+
+    if args.algorithm == 'lstm-sac':
+        from policies.lstm_policy import LSTMFeatureExtractor
+        policy_kwargs = dict(
+            features_extractor_class=LSTMFeatureExtractor,
+            features_extractor_kwargs=dict(
+                history_len=OBSERVATION_HISTORY,
+                input_dim=actual_obs_dim,
+                hidden_dim=256,
+                features_dim=256
+            ),
+            net_arch=dict(pi=[256], qf=[256])
+        )
+
+    elif args.algorithm == 'tx-sac':
+        from policies.transformer_policy import TemporalTransformerExtractor
+        policy_kwargs = dict(
+            features_extractor_class=TemporalTransformerExtractor,
+            features_extractor_kwargs=dict(
+                history_len=OBSERVATION_HISTORY,
+                input_dim=actual_obs_dim,
+                features_dim=256
+            ),
+            net_arch=dict(pi=[256], qf=[256])
+        )
+
+    # ---------------- MODEL CREATION ----------------
+    if args.algorithm == 'sac':
+        model = SAC(
+            "MlpPolicy",
+            env,
+            learning_rate=3e-4,
+            buffer_size=300000,
+            batch_size=256,
+            tau=0.005,
+            gamma=0.99,
+            train_freq=1,
+            gradient_steps=1,
+            ent_coef="auto_0.1",
+            verbose=1,
+            tensorboard_log=f"./tb_logs/{model_name}",
+            device=device
+        )
+
+    elif args.algorithm == 'ppo':
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=128,
+            n_epochs=10,
+            gamma=0.995,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            ent_coef=0.01,
+            policy_kwargs=dict(net_arch=[256, 256]),
+            verbose=1,
+            tensorboard_log=f"./tb_logs/{model_name}",
+            device=device
+        )
+
+    elif args.algorithm in ['lstm-sac', 'tx-sac']:
+        model = SAC(
+            "MlpPolicy",
+            env,
+            learning_rate=1e-4,
+            buffer_size=400000,
+            batch_size=512,
+            tau=0.005,
+            gamma=0.99,
+            train_freq=1,
+            gradient_steps=1,
+            ent_coef="auto_0.2",
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            tensorboard_log=f"./tb_logs/{model_name}",
+            device=device
+        )
+    
+
+    # ---------------- TRAIN ----------------
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=f"./models/{model_name}",
+        log_path=f"./logs/{model_name}",
+        eval_freq=args.eval_freq,
+        deterministic=True
+    )
+
+    model.learn(total_timesteps=args.total_timesteps, callback=eval_callback)
+
+    # ---------------- SAVE ----------------
+    model_dir = f"./models/{model_name}_final"
+    os.makedirs(model_dir, exist_ok=True)
+    model.save(os.path.join(model_dir, "model.zip"))
+    env.save(os.path.join(model_dir, "vecnormalize.pkl"))
+
+if __name__ == "__main__":
+    main()

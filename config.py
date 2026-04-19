@@ -1,9 +1,9 @@
 import numpy as np
 
 # Simulation
-GUI = False                 # default, overridden by command line
+GUI = False           # default, overridden by command line
 TIME_STEP = 1./240.
-MAX_STEPS = 5000
+MAX_STEPS = 1000
 # Environment type (will be overridden by command line)
 ENV_TYPE = 'static'   # default, can be 'static', 'mixed', or 'dense'
 
@@ -20,25 +20,29 @@ LIDAR_OFFSET = 0.20
 
 # Goal & Reward
 GOAL_THRESHOLD = 0.3
-COLLISION_DIST = 0.15
+COLLISION_DIST = 0.05
 
-#STATIC_OBSTACLES = []  #No obstacles for now.
+#STATIC_OBSTACLES = [ (-1.2, 0.8), (-1.5, -0.5), (0.5, -1.2)
+                   # ]  #No obstacles for now.
 # Obstacle configurations
 
-STATIC_OBSTACLES = [
-     (1.2, 1.2), (1.8, 0.5), (0.5, 1.8), (-0.5, 1.5),
-     (-1.2, 0.8), (-1.5, -0.5), (0.5, -1.2), (1.5, -0.8)
+STATIC_OBSTACLES = [ (-1.2, 0.8), (-1.5, -0.5), (0.5, -1.2),
+     (1.2, 1.2), (1.8, 0.5), 
+   (-1.5, -0.5),  (1.5, -0.8), (-0.5, 1.5)
 ]
 DYNAMIC_CONFIG = {
     'static': {'num': 0},
-    'mixed': {'num': 5, 'type': 'linear_bounce', 'speed': 0.2, 'bounds': [-3, 3]},
-    'dense': {'num': 10, 'type': 'linear_bounce', 'speed': 0.2, 'bounds': [-3, 3]}
+    'mixed': {'num': 5, 'type': 'linear_bounce', 'speed': 0.2, 'bounds': [-3, 3, -3, 3]},
+    'dense': {'num': 10, 'type': 'linear_bounce', 'speed': 0.2, 'bounds': [-3, 3, -3, 3]}
 }
 
 # Global planner (RRT)
 PLANNER_TYPE = 'rrt'
-PLANNER_UPDATE_FREQ = 10      # steps between replans
-WAYPOINT_DISTANCE = 0.5       # meters ahead on the path
+PLANNER_UPDATE_FREQ = 4      # steps between replans
+WAYPOINT_DISTANCE = 0.15       # meters ahead on the path
 
 # Temporal observation (for LSTM and Transformer)
 OBSERVATION_HISTORY = 8       # number of past LiDAR scans
+# LiDAR noise parameters (set to zero for perfect sensor, old behaviour)
+LIDAR_NOISE_STD = 0.0       # standard deviation of Gaussian noise (e.g., 0.02)
+LIDAR_DROPOUT_RATE = 0.0    # fraction of rays that return max range (e.g., 0.03)

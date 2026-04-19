@@ -19,7 +19,7 @@ class SimpleController:
         angle_error = angle_to_waypoint - robot_yaw
         angle_error = np.arctan2(np.sin(angle_error), np.cos(angle_error))
         # Simple P controller
-        linear = LINEAR_VEL * 0.5   # half speed for safety
+        linear = LINEAR_VEL    # half speed for safety
         angular = np.clip(angle_error * 2.0, -ANGULAR_VEL, ANGULAR_VEL)
         # Normalise actions to [-1,1] as in RL
         return np.array([linear / LINEAR_VEL, angular / ANGULAR_VEL])

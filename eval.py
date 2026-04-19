@@ -1,3 +1,7 @@
+# Fully Corrected eval.py
+# Works with both old Gym (4‑value step) and Gymnasium (5‑value step)
+# Compatible with end‑to‑end and hybrid environments, with or without temporal wrappers.
+
 import argparse
 import os
 import csv
@@ -6,107 +10,127 @@ import random
 import numpy as np
 import torch
 import gym
+
 from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from env import make_env
+
+from env.tb3_env import TB3Env
+from env.tb3_env_hybrid import TB3HybridEnv
 from env.observation_wrapper import TemporalObservationWrapper
-from config import OBSERVATION_HISTORY, GOAL_THRESHOLD, COLLISION_DIST, LIDAR_RANGE, NUM_LIDAR, ANGULAR_VEL
 
-class GymWrapper(gym.Env):
-    def __init__(self, hybrid=False):
-        super().__init__()
-        self.env = make_env(hybrid)
-        self.hybrid = hybrid
-        if hybrid:
-            low = np.array([0.0] * NUM_LIDAR + [-1.0, -1.0, -1.0])
-            high = np.array([1.0] * NUM_LIDAR + [1.0, 1.0, 1.0])
-            self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
-        else:
-            self.observation_space = gym.spaces.Box(low=0, high=1, shape=(NUM_LIDAR,), dtype=np.float32)
-        self.action_space = gym.spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
+from config import (
+    OBSERVATION_HISTORY, GOAL_THRESHOLD, COLLISION_DIST,
+    LIDAR_RANGE, ANGULAR_VEL
+)
 
-    def reset(self, *, seed=None, options=None):
-        obs = self.env.reset()
-        return obs, {}
-
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        terminated = done
-        truncated = False
-        return obs, reward, terminated, truncated, info
-
-    def get_robot_position(self):
-        return self.env.get_robot_position()
-
-    def get_dynamic_obstacle_distances(self):
-        return self.env.get_dynamic_obstacle_distances()
-
+# ------------------------------------------------------------
+# Seeding for reproducibility
+# ------------------------------------------------------------
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+# ------------------------------------------------------------
+# Base environment factory
+# ------------------------------------------------------------
+def make_base_env(hybrid: bool, env_type: str, gui: bool):
+    """Create the appropriate base environment (TB3Env or TB3HybridEnv)."""
+    if hybrid:
+        return TB3HybridEnv(env_type=env_type, gui=gui)
+    else:
+        return TB3Env(env_type=env_type, gui=gui)
+
+# ------------------------------------------------------------
+# Unwrap VecNormalize → DummyVecEnv → underlying base env
+# ------------------------------------------------------------
+def unwrap_original_env(env):
+    """
+    Recursively unwrap VecNormalize and DummyVecEnv to access the original
+    TB3Env or TB3HybridEnv instance. Needed to call get_robot_pose(), get_lidar(), etc.
+    """
+    if isinstance(env, VecNormalize):
+        env = env.venv
+    if isinstance(env, DummyVecEnv):
+        env = env.envs[0]
+    while hasattr(env, "env"):
+        env = env.env
+    return env
+
+# ------------------------------------------------------------
+# Argument parsing
+# ------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, required=True)
-    parser.add_argument('--env_type', type=str, default='mixed', choices=['static','mixed','dense'])
-    parser.add_argument('--algorithm', type=str, required=True, choices=['sac','ppo','lstm-sac','tx-sac'])
-    parser.add_argument('--hybrid', action='store_true')
-    parser.add_argument('--num_episodes', type=int, default=100)
-    parser.add_argument('--gui', action='store_true')
+    parser.add_argument('--model_path', type=str, required=True,
+                        help="Path to the trained model .zip file")
+    parser.add_argument('--env_type', type=str, default='mixed',
+                        choices=['static', 'mixed', 'dense'])
+    parser.add_argument('--algorithm', type=str, required=True,
+                        choices=['sac', 'ppo', 'cnn-gru-sac', 'lstm-sac', 'tx-sac'])
+    parser.add_argument('--hybrid', action='store_true',
+                        help="Use hybrid environment (RRT + waypoint)")
+    parser.add_argument('--num_episodes', type=int, default=50)
+    parser.add_argument('--gui', action='store_true',
+                        help="Show PyBullet GUI")
     parser.add_argument('--output', type=str, default='eval_results.csv')
     parser.add_argument('--seed', type=int, default=42)
     return parser.parse_args()
 
+# ------------------------------------------------------------
+# Main evaluation
+# ------------------------------------------------------------
 def main():
     args = parse_args()
     set_seed(args.seed)
+
+    # Update global config (used by environments)
     import config
     config.ENV_TYPE = args.env_type
     config.GUI = args.gui
 
-    env = GymWrapper(hybrid=args.hybrid)
-    if args.algorithm in ['lstm-sac', 'tx-sac']:
-        env = TemporalObservationWrapper(env, history_len=OBSERVATION_HISTORY)
-    env = DummyVecEnv([lambda: env])
+    # ---------------- CREATE BASE ENVIRONMENT ----------------
+    base_env = make_base_env(args.hybrid, args.env_type, args.gui)
+    if args.algorithm in ['cnn-gru-sac', 'lstm-sac', 'tx-sac']:
+        # Wrap with TemporalObservationWrapper to stack history
+        base_env = TemporalObservationWrapper(base_env)
+    env = DummyVecEnv([lambda: base_env])
 
-    # Load normalization stats if they exist
+    # ---------------- LOAD NORMALIZATION STATS ----------------
     norm_path = os.path.join(os.path.dirname(args.model_path), "vecnormalize.pkl")
     if os.path.exists(norm_path):
         try:
             env = VecNormalize.load(norm_path, env)
-            env.training = False
-            env.norm_reward = False
-        except AssertionError as e:
-            print(f"Warning: Could not load normalization stats due to shape mismatch: {e}. Proceeding without normalization.")
-            env = VecNormalize(env, norm_obs=False, norm_reward=False, training=False)
+            env.training = False      # disable updates
+            env.norm_reward = False   # we want raw rewards for metrics
+            print(f"Loaded VecNormalize stats from {norm_path}")
+        except Exception as e:
+            print(f"Warning: VecNormalize load failed ({e}). Running without normalization.")
     else:
-        print("Warning: No normalization stats found. Proceeding without normalization.")
-        env = VecNormalize(env, norm_obs=False, norm_reward=False, training=False)
+        print("Warning: No VecNormalize stats found.")
 
-    # Load model
-    if args.algorithm in ['sac', 'lstm-sac', 'tx-sac']:
+    # ---------------- LOAD TRAINED MODEL ----------------
+    if args.algorithm in ['sac', 'cnn-gru-sac', 'lstm-sac', 'tx-sac']:
         model = SAC.load(args.model_path, env=env)
-    elif args.algorithm == 'ppo':
+    else:  # PPO
         model = PPO.load(args.model_path, env=env)
 
     metrics = []
+
+    # ---------------- EVALUATION LOOP ----------------
     for ep in range(args.num_episodes):
         obs = env.reset()
-        # Access underlying environment for position and goal
-        base_env = env.envs[0] if hasattr(env, 'envs') else env
-        while hasattr(base_env, 'env'):
-            base_env = base_env.env
-        original_env = base_env.env if hasattr(base_env, 'env') else base_env
+        original_env = unwrap_original_env(env)
 
-        start_pos = original_env.get_robot_position()[:2]
-        goal_pos = original_env.goal[:2]
-        straight_line_dist = np.linalg.norm(np.array(goal_pos) - np.array(start_pos))
+        # Record start and goal positions
+        start_pos = np.array(original_env.get_robot_pose()[:2])
+        goal_pos = np.array(original_env.goal_pos[:2])
+        straight_line_dist = np.linalg.norm(goal_pos - start_pos)
 
         done = False
         steps = 0
         path_length = 0.0
-        prev_pos = np.array(start_pos)
+        prev_pos = start_pos.copy()
         collision = False
         dynamic_collision = False
         success = False
@@ -117,41 +141,51 @@ def main():
         start_time = time.time()
 
         while not done:
+            # Get action from policy (deterministic for evaluation)
             action, _ = model.predict(obs, deterministic=True)
+
+            # Record angular velocity for smoothness metric
             ang_vel = action[0][1] * ANGULAR_VEL
             angular_velocities.append(ang_vel)
 
-            result = env.step(action)
-            if len(result) == 5:
-                obs, reward, terminated, truncated, info = result
+            # ---------- CRITICAL FIX: handle both 4-value and 5-value step ----------
+            step_result = env.step(action)
+            if len(step_result) == 5:          # Gymnasium style
+                obs, reward, terminated, truncated, info = step_result
                 done = terminated or truncated
-            else:
-                obs, reward, done, info = result
-                terminated = done
-                truncated = False
+            else:                              # Old Gym style (4 values)
+                obs, reward, done, info = step_result
+            # ------------------------------------------------------------------------
 
             steps += 1
-            curr_pos = np.array(original_env.get_robot_position()[:2])
-            path_length += np.linalg.norm(curr_pos - prev_pos)
+
+            # Get current robot position (x, y)
+            curr_pos = np.array(original_env.get_robot_pose()[:2])
+
+            # Path length (Euclidean distance travelled)
+            step_dist = np.linalg.norm(curr_pos - prev_pos)
+            path_length += step_dist
             prev_pos = curr_pos
 
-            raw_lidar = original_env.get_obs()
+            # Stuck detection: if robot moves less than 1 cm for 50 steps
+            if step_dist < 0.01:
+                stuck_counter += 1
+            else:
+                stuck_counter = 0
+            if stuck_counter >= 50:
+                stuck_events += 1
+                stuck_counter = 0
+
+            # LiDAR clearance (minimum distance to any obstacle)
+            raw_lidar = np.array(original_env.get_lidar(), dtype=np.float32)
+            raw_lidar = np.clip(raw_lidar, 0.0, 1.0)
             min_dist = np.min(raw_lidar) * LIDAR_RANGE
             min_distances.append(min_dist)
 
-            if steps > 1:
-                progress = np.linalg.norm(curr_pos - prev_pos)
-                if progress < 0.01:
-                    stuck_counter += 1
-                else:
-                    stuck_counter = 0
-                if stuck_counter >= 50:
-                    stuck_events += 1
-                    stuck_counter = 0
-
-            # Collision detection based on reward -200 (from your reward function)
-            if reward == -200.0 and not collision:
+            # Collision detection (from info dict or reward heuristic)
+            if isinstance(info, dict) and info.get('collision', False):
                 collision = True
+                # Check if collision was with a dynamic obstacle
                 try:
                     dyn_dists = original_env.get_dynamic_obstacle_distances()
                     if dyn_dists and min(dyn_dists) < COLLISION_DIST:
@@ -159,20 +193,19 @@ def main():
                 except AttributeError:
                     pass
 
+        # Episode finished – compute metrics
         time_to_goal = time.time() - start_time
-        angular_velocities = np.array(angular_velocities)
-        if len(angular_velocities) > 1:
-            jerk = np.mean(np.abs(np.diff(angular_velocities)))
-        else:
-            jerk = 0.0
+        jerk = np.mean(np.abs(np.diff(angular_velocities))) if len(angular_velocities) > 1 else 0.0
         min_clearance = np.min(min_distances) if min_distances else 0.0
         path_efficiency = straight_line_dist / path_length if path_length > 0 else 0.0
 
+        # Success if reached goal without collision
         if not collision:
-            dist_to_goal = np.linalg.norm(curr_pos - np.array(goal_pos))
+            dist_to_goal = np.linalg.norm(curr_pos - goal_pos)
             if dist_to_goal < GOAL_THRESHOLD:
                 success = True
 
+        # Store episode results
         metrics.append({
             'episode': ep,
             'steps': steps,
@@ -186,29 +219,29 @@ def main():
             'stuck_events': stuck_events,
             'success': success
         })
-        print(f"Episode {ep}: success={success}, steps={steps}, time={time_to_goal:.2f}s, "
-              f"path_efficiency={path_efficiency:.2f}, jerk={jerk:.3f}, min_clearance={min_clearance:.2f}")
 
-    # Write detailed results
+        print(f"Episode {ep}: success={success}, steps={steps}, "
+              f"time={time_to_goal:.2f}s, eff={path_efficiency:.2f}, "
+              f"jerk={jerk:.3f}, clearance={min_clearance:.2f}")
+
+    # ---------------- SAVE RESULTS TO CSV ----------------
     with open(args.output, 'w', newline='') as f:
-        fieldnames = ['episode','steps','time_to_goal','path_length','path_efficiency',
-                      'smoothness_jerk','min_clearance','collision','dynamic_collision',
-                      'stuck_events','success']
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
         writer.writeheader()
         writer.writerows(metrics)
 
-    # Print summary statistics
+    # ---------------- PRINT SUMMARY ----------------
     success_rate = np.mean([m['success'] for m in metrics]) * 100
     collision_rate = np.mean([m['collision'] for m in metrics]) * 100
     dynamic_collision_rate = np.mean([m['dynamic_collision'] for m in metrics]) * 100
     avg_steps = np.mean([m['steps'] for m in metrics])
-    avg_path_efficiency = np.mean([m['path_efficiency'] for m in metrics])
+    avg_eff = np.mean([m['path_efficiency'] for m in metrics])
+
     print("\n===== Evaluation Summary =====")
     print(f"Success rate: {success_rate:.1f}%")
     print(f"Collision rate: {collision_rate:.1f}% (dynamic: {dynamic_collision_rate:.1f}%)")
     print(f"Average steps: {avg_steps:.1f}")
-    print(f"Path efficiency: {avg_path_efficiency:.2f}")
+    print(f"Path efficiency: {avg_eff:.2f}")
     print(f"Results saved to {args.output}")
 
 if __name__ == "__main__":
