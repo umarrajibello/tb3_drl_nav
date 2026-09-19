@@ -1,13 +1,13 @@
 import numpy as np
 
 # Simulation
-GUI = False           # default, overridden by command line
+GUI = True       # default, overridden by command line
 TIME_STEP = 1./240.
 MAX_STEPS = 1000
 # Environment type (will be overridden by command line)
 ENV_TYPE = 'static'   # default, can be 'static', 'mixed', or 'dense'
 
-# Robot
+# RobotA
 WHEEL_RADIUS = 0.033
 WHEEL_BASE = 0.16
 LINEAR_VEL = 0.22
@@ -19,8 +19,8 @@ LIDAR_RANGE = 3.5
 LIDAR_OFFSET = 0.20
 
 # Goal & Reward
-GOAL_THRESHOLD = 0.3
-COLLISION_DIST = 0.05
+GOAL_THRESHOLD = 0.2
+COLLISION_DIST = 0.15
 
 #STATIC_OBSTACLES = [ (-1.2, 0.8), (-1.5, -0.5), (0.5, -1.2)
                    # ]  #No obstacles for now.
@@ -38,8 +38,8 @@ DYNAMIC_CONFIG = {
 
 # Global planner (RRT)
 PLANNER_TYPE = 'rrt'
-PLANNER_UPDATE_FREQ = 4      # steps between replans
-WAYPOINT_DISTANCE = 0.15       # meters ahead on the path
+PLANNER_UPDATE_FREQ = 10      # steps between replans
+WAYPOINT_DISTANCE = 1.0       # meters ahead on the path
 
 # Temporal observation (for LSTM and Transformer)
 OBSERVATION_HISTORY = 8       # number of past LiDAR scans

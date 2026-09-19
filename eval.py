@@ -1,6 +1,5 @@
-# Fully Corrected eval.py
-# Works with both old Gym (4‑value step) and Gymnasium (5‑value step)
-# Compatible with end‑to‑end and hybrid environments, with or without temporal wrappers.
+#!/usr/bin/env python3
+# eval.py – Corrected: uses info['reached_goal'] to set success reliably
 
 import argparse
 import os
@@ -9,7 +8,7 @@ import time
 import random
 import numpy as np
 import torch
-import gym
+from pathlib import Path
 
 from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -18,111 +17,104 @@ from env.tb3_env import TB3Env
 from env.tb3_env_hybrid import TB3HybridEnv
 from env.observation_wrapper import TemporalObservationWrapper
 
-from config import (
-    OBSERVATION_HISTORY, GOAL_THRESHOLD, COLLISION_DIST,
-    LIDAR_RANGE, ANGULAR_VEL
-)
+from config import GOAL_THRESHOLD, COLLISION_DIST, LIDAR_RANGE, ANGULAR_VEL
 
-# ------------------------------------------------------------
-# Seeding for reproducibility
-# ------------------------------------------------------------
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-# ------------------------------------------------------------
-# Base environment factory
-# ------------------------------------------------------------
 def make_base_env(hybrid: bool, env_type: str, gui: bool):
-    """Create the appropriate base environment (TB3Env or TB3HybridEnv)."""
     if hybrid:
         return TB3HybridEnv(env_type=env_type, gui=gui)
     else:
         return TB3Env(env_type=env_type, gui=gui)
 
-# ------------------------------------------------------------
-# Unwrap VecNormalize → DummyVecEnv → underlying base env
-# ------------------------------------------------------------
 def unwrap_original_env(env):
-    """
-    Recursively unwrap VecNormalize and DummyVecEnv to access the original
-    TB3Env or TB3HybridEnv instance. Needed to call get_robot_pose(), get_lidar(), etc.
-    """
-    if isinstance(env, VecNormalize):
+    while hasattr(env, 'venv'):
         env = env.venv
     if isinstance(env, DummyVecEnv):
         env = env.envs[0]
-    while hasattr(env, "env"):
+    while hasattr(env, 'env'):
         env = env.env
     return env
 
-# ------------------------------------------------------------
-# Argument parsing
-# ------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True,
-                        help="Path to the trained model .zip file")
+                        help='Path to the trained model .zip file (or base name without .zip)')
     parser.add_argument('--env_type', type=str, default='mixed',
                         choices=['static', 'mixed', 'dense'])
     parser.add_argument('--algorithm', type=str, required=True,
                         choices=['sac', 'ppo', 'cnn-gru-sac', 'lstm-sac', 'tx-sac'])
-    parser.add_argument('--hybrid', action='store_true',
-                        help="Use hybrid environment (RRT + waypoint)")
+    parser.add_argument('--hybrid', action='store_true')
     parser.add_argument('--num_episodes', type=int, default=50)
-    parser.add_argument('--gui', action='store_true',
-                        help="Show PyBullet GUI")
+    parser.add_argument('--gui', action='store_true')
     parser.add_argument('--output', type=str, default='eval_results.csv')
     parser.add_argument('--seed', type=int, default=42)
     return parser.parse_args()
 
-# ------------------------------------------------------------
-# Main evaluation
-# ------------------------------------------------------------
 def main():
     args = parse_args()
     set_seed(args.seed)
 
-    # Update global config (used by environments)
     import config
     config.ENV_TYPE = args.env_type
     config.GUI = args.gui
 
-    # ---------------- CREATE BASE ENVIRONMENT ----------------
+    print(f"\n{'='*60}")
+    print(f"Evaluating {args.algorithm} on {args.env_type} environment")
+    print(f"Hybrid mode: {args.hybrid}")
+    print(f"Model path: {args.model_path}")
+    print(f"Episodes: {args.num_episodes}")
+    print(f"{'='*60}\n")
+
+    # Locate model file
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        model_path_zip = model_path.with_suffix('.zip')
+        if model_path_zip.exists():
+            model_path = model_path_zip
+        else:
+            raise FileNotFoundError(f"Model file not found: {model_path} or {model_path_zip}")
+    print(f"[Eval] Using model: {model_path}")
+
+    # Create environment
     base_env = make_base_env(args.hybrid, args.env_type, args.gui)
     if args.algorithm in ['cnn-gru-sac', 'lstm-sac', 'tx-sac']:
-        # Wrap with TemporalObservationWrapper to stack history
         base_env = TemporalObservationWrapper(base_env)
+        print("[Eval] TemporalObservationWrapper applied (history=8)")
+
     env = DummyVecEnv([lambda: base_env])
 
-    # ---------------- LOAD NORMALIZATION STATS ----------------
-    norm_path = os.path.join(os.path.dirname(args.model_path), "vecnormalize.pkl")
-    if os.path.exists(norm_path):
+    # Load VecNormalize stats
+    norm_path = model_path.parent / "vecnormalize.pkl"
+    if norm_path.exists():
         try:
-            env = VecNormalize.load(norm_path, env)
-            env.training = False      # disable updates
-            env.norm_reward = False   # we want raw rewards for metrics
-            print(f"Loaded VecNormalize stats from {norm_path}")
+            env = VecNormalize.load(str(norm_path), env)
+            env.training = False
+            env.norm_reward = False
+            print(f"[Eval] Loaded VecNormalize stats from {norm_path}")
         except Exception as e:
-            print(f"Warning: VecNormalize load failed ({e}). Running without normalization.")
+            print(f"[Eval] Warning: could not load VecNormalize ({e})")
     else:
-        print("Warning: No VecNormalize stats found.")
+        print("[Eval] No VecNormalize stats found. Running without normalisation.")
 
-    # ---------------- LOAD TRAINED MODEL ----------------
+    # Load model
     if args.algorithm in ['sac', 'cnn-gru-sac', 'lstm-sac', 'tx-sac']:
-        model = SAC.load(args.model_path, env=env)
-    else:  # PPO
-        model = PPO.load(args.model_path, env=env)
+        model = SAC.load(str(model_path), env=env)
+    else:
+        model = PPO.load(str(model_path), env=env)
+    print("[Eval] Model loaded successfully.\n")
 
     metrics = []
 
-    # ---------------- EVALUATION LOOP ----------------
     for ep in range(args.num_episodes):
         obs = env.reset()
+        obs = np.asarray(obs, dtype=np.float32)
         original_env = unwrap_original_env(env)
 
-        # Record start and goal positions
         start_pos = np.array(original_env.get_robot_pose()[:2])
         goal_pos = np.array(original_env.goal_pos[:2])
         straight_line_dist = np.linalg.norm(goal_pos - start_pos)
@@ -139,35 +131,28 @@ def main():
         stuck_counter = 0
         stuck_events = 0
         start_time = time.time()
+        goal_reached_info = False   # track info flag
 
         while not done:
-            # Get action from policy (deterministic for evaluation)
             action, _ = model.predict(obs, deterministic=True)
-
-            # Record angular velocity for smoothness metric
             ang_vel = action[0][1] * ANGULAR_VEL
             angular_velocities.append(ang_vel)
 
-            # ---------- CRITICAL FIX: handle both 4-value and 5-value step ----------
             step_result = env.step(action)
-            if len(step_result) == 5:          # Gymnasium style
+            if len(step_result) == 5:
                 obs, reward, terminated, truncated, info = step_result
+                obs = np.asarray(obs, dtype=np.float32)
                 done = terminated or truncated
-            else:                              # Old Gym style (4 values)
+            else:
                 obs, reward, done, info = step_result
-            # ------------------------------------------------------------------------
+                obs = np.asarray(obs, dtype=np.float32)
 
             steps += 1
-
-            # Get current robot position (x, y)
             curr_pos = np.array(original_env.get_robot_pose()[:2])
-
-            # Path length (Euclidean distance travelled)
             step_dist = np.linalg.norm(curr_pos - prev_pos)
             path_length += step_dist
             prev_pos = curr_pos
 
-            # Stuck detection: if robot moves less than 1 cm for 50 steps
             if step_dist < 0.01:
                 stuck_counter += 1
             else:
@@ -176,16 +161,13 @@ def main():
                 stuck_events += 1
                 stuck_counter = 0
 
-            # LiDAR clearance (minimum distance to any obstacle)
             raw_lidar = np.array(original_env.get_lidar(), dtype=np.float32)
             raw_lidar = np.clip(raw_lidar, 0.0, 1.0)
             min_dist = np.min(raw_lidar) * LIDAR_RANGE
             min_distances.append(min_dist)
 
-            # Collision detection (from info dict or reward heuristic)
             if isinstance(info, dict) and info.get('collision', False):
                 collision = True
-                # Check if collision was with a dynamic obstacle
                 try:
                     dyn_dists = original_env.get_dynamic_obstacle_distances()
                     if dyn_dists and min(dyn_dists) < COLLISION_DIST:
@@ -193,19 +175,23 @@ def main():
                 except AttributeError:
                     pass
 
+            # Capture goal reached flag from info
+            if isinstance(info, dict) and info.get('reached_goal', False):
+                goal_reached_info = True
+
         # Episode finished – compute metrics
         time_to_goal = time.time() - start_time
         jerk = np.mean(np.abs(np.diff(angular_velocities))) if len(angular_velocities) > 1 else 0.0
         min_clearance = np.min(min_distances) if min_distances else 0.0
         path_efficiency = straight_line_dist / path_length if path_length > 0 else 0.0
 
-        # Success if reached goal without collision
+        # Determine success: either by distance or by info flag
         if not collision:
-            dist_to_goal = np.linalg.norm(curr_pos - goal_pos)
-            if dist_to_goal < GOAL_THRESHOLD:
+            final_pos = np.array(original_env.get_robot_pose()[:2])
+            dist_to_goal = np.linalg.norm(final_pos - goal_pos)
+            if dist_to_goal < GOAL_THRESHOLD or goal_reached_info:
                 success = True
 
-        # Store episode results
         metrics.append({
             'episode': ep,
             'steps': steps,
@@ -220,29 +206,37 @@ def main():
             'success': success
         })
 
-        print(f"Episode {ep}: success={success}, steps={steps}, "
+        print(f"Episode {ep:3d}: success={success}, steps={steps:3d}, "
               f"time={time_to_goal:.2f}s, eff={path_efficiency:.2f}, "
-              f"jerk={jerk:.3f}, clearance={min_clearance:.2f}")
+              f"jerk={jerk:.3f}, clearance={min_clearance:.2f}, "
+              f"collision={collision}, dyn_coll={dynamic_collision}")
 
-    # ---------------- SAVE RESULTS TO CSV ----------------
-    with open(args.output, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
-        writer.writeheader()
-        writer.writerows(metrics)
+    if metrics:
+        with open(args.output, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
+            writer.writeheader()
+            writer.writerows(metrics)
 
-    # ---------------- PRINT SUMMARY ----------------
     success_rate = np.mean([m['success'] for m in metrics]) * 100
     collision_rate = np.mean([m['collision'] for m in metrics]) * 100
     dynamic_collision_rate = np.mean([m['dynamic_collision'] for m in metrics]) * 100
     avg_steps = np.mean([m['steps'] for m in metrics])
     avg_eff = np.mean([m['path_efficiency'] for m in metrics])
+    avg_clearance = np.mean([m['min_clearance'] for m in metrics])
+    avg_stuck = np.mean([m['stuck_events'] for m in metrics])
 
-    print("\n===== Evaluation Summary =====")
-    print(f"Success rate: {success_rate:.1f}%")
-    print(f"Collision rate: {collision_rate:.1f}% (dynamic: {dynamic_collision_rate:.1f}%)")
-    print(f"Average steps: {avg_steps:.1f}")
-    print(f"Path efficiency: {avg_eff:.2f}")
-    print(f"Results saved to {args.output}")
+    print("\n" + "="*60)
+    print("EVALUATION SUMMARY")
+    print("="*60)
+    print(f"Success rate:            {success_rate:.1f}%")
+    print(f"Collision rate:          {collision_rate:.1f}%")
+    print(f"  - Dynamic collision:   {dynamic_collision_rate:.1f}%")
+    print(f"Average steps:           {avg_steps:.1f}")
+    print(f"Path efficiency:         {avg_eff:.3f}")
+    print(f"Min clearance (avg):     {avg_clearance:.2f} m")
+    print(f"Stuck events (avg):      {avg_stuck:.2f}")
+    print(f"Results saved to:        {args.output}")
+    print("="*60 + "\n")
 
 if __name__ == "__main__":
     main()

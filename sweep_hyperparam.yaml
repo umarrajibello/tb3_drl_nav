@@ -1,0 +1,52 @@
+# sweep_hyperparam.yaml – HYPERPARAMETER SENSITIVITY (14 hours on 1 GPU)
+# Bayesian optimization for learning rate, batch size, gamma
+
+program: train.py
+method: bayes
+name: hyperparam-sensitivity
+metric:
+  name: eval/success_rate
+  goal: maximize
+
+parameters:
+  learning_rate:
+    distribution: log_uniform
+    min: -4.5              # 3e-5
+    max: -3.0              # 1e-3
+  batch_size:
+    values: [128, 256]
+  gamma:
+    values: [0.99, 0.995]
+  
+  # Fixed – using best reward from ablation (to be updated later)
+  goal_reward:
+    value: 100
+  collision_penalty:
+    value: 50
+  progress_weight:
+    value: 2.0
+  away_penalty:
+    value: 3.0
+  
+  env_type:
+    value: static
+  algorithm:
+    value: tx-sac
+  hybrid:
+    value: true
+  total_timesteps:
+    value: 150000
+  num_envs:
+    value: 12
+  eval_freq:
+    value: 10000
+  seed:
+    values: [42, 123]
+  
+  gpu:
+    value: true
+  
+  wandb_project:
+    value: tb3-nav-hyperparam
+  wandb_mode:
+    value: online

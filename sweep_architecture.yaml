@@ -1,0 +1,45 @@
+# sweep_architecture.yaml – ARCHITECTURE COMPARISON (5 hours on 1 GPU)
+# Compares SAC vs Tx-SAC, hybrid vs end-to-end
+
+program: train.py
+method: grid
+name: architecture-comparison
+metric:
+  name: eval/success_rate
+  goal: maximize
+
+parameters:
+  algorithm:
+    values: [sac, tx-sac]
+  hybrid:
+    values: [true, false]
+  
+  # Fixed parameters
+  env_type:
+    value: dense
+  total_timesteps:
+    value: 200000
+  num_envs:
+    value: 12
+  eval_freq:
+    value: 10000
+  seed:
+    values: [42, 123, 456]
+  
+  # Best reward parameters (to be confirmed)
+  goal_reward:
+    value: 100
+  collision_penalty:
+    value: 50
+  progress_weight:
+    value: 2.0
+  away_penalty:
+    value: 3.0
+  
+  gpu:
+    value: true
+  
+  wandb_project:
+    value: tb3-nav-architecture
+  wandb_mode:
+    value: online

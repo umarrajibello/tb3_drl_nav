@@ -1,0 +1,36 @@
+program: train.py
+method: grid
+name: fast-hyperparameter-trends
+metric:
+  name: eval/success_rate
+  goal: maximize
+
+parameters:
+  learning_rate:
+    values: [1e-4, 3e-4, 5e-4]
+  batch_size:
+    values: [128, 256]
+  goal_reward:
+    value: 500
+  progress_weight:
+    value: 5.0
+  collision_penalty:
+    value: 150
+  hybrid:
+    value: false
+  algorithm:
+    value: sac
+  env_type:
+    value: static
+  total_timesteps:
+    value: 100000
+  num_envs:
+    value: 16
+  eval_freq:
+    value: 10000
+  seed:
+    value: 42
+  gpu:
+    value: true
+  wandb_project:
+    value: tb3-nav-fast-trends

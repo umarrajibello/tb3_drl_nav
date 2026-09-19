@@ -11,7 +11,7 @@ config.GUI = True
 #env = TB3Env()
 #env.reset()
 
-from env.tb3_env_hybrid import TB3HybridEnv
+from env.tb3_env_hybrid1 import TB3HybridEnv
 env = TB3HybridEnv(env_type="dense", gui=True)
 obs = env.reset()
 print("Reset done")
