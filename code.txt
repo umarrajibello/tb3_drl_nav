@@ -1,40 +1,120 @@
-(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ cat train.py 
-# train.py
+av$ cat train.py
+# train.py – Complete W&B integration with normalised reward and sweep support
+
 import argparse
 import random
 import numpy as np
 import torch
 import os
+import sys
+import subprocess
+from datetime import datetime
+
+import wandb
+from wandb.integration.sb3 import WandbCallback
 
 from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback
 
 from env.tb3_env import TB3Env
-from env.tb3_env_hybrid import TB3HybridEnv          # FIXED: correct filename
+from env.tb3_env_hybrid import TB3HybridEnv
 from env.observation_wrapper import TemporalObservationWrapper
 from config import OBSERVATION_HISTORY
 
-# ------------------------------------------------------------
-# Seeding helper
-# ------------------------------------------------------------
+
+# ============================================================
+# ARGUMENT PARSING
+# ============================================================
+def parse_args():
+    parser = argparse.ArgumentParser()
+    
+    # Environment
+    parser.add_argument('--env_type', type=str, default='mixed',
+                        choices=['empty','static', 'mixed', 'dense'])
+    parser.add_argument('--hybrid', type=lambda x: x.lower() == 'true', default=False,
+                        help='Use hybrid environment (true/false)')
+    parser.add_argument('--gui', action='store_true')
+    
+    # Algorithm
+    parser.add_argument('--algorithm', type=str, default='sac',
+                        choices=['sac', 'ppo', 'lstm-sac', 'tx-sac', 'cnn-gru-sac'])
+    
+    # Training
+    parser.add_argument('--total_timesteps', type=int, default=500000)
+    parser.add_argument('--eval_freq', type=int, default=10000)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--num_envs', type=int, default=1)
+    parser.add_argument('--pretrained', type=str, default=None)
+    parser.add_argument('--gpu', type=lambda x: x.lower() == 'true', default=True,
+                        help='Use GPU (true/false)')
+    parser.add_argument('--exp_suffix', type=str, default='')
+    
+    # Reward parameters (fully tunable for sweeps)
+    parser.add_argument('--goal_reward', type=float, default=20.0,
+                        help='Reward for reaching the goal')
+    parser.add_argument('--collision_penalty', type=float, default=10.0,
+                        help='Penalty for collision')
+    parser.add_argument('--progress_weight', type=float, default=3.0,
+                        help='Weight for progress toward waypoint/goal')
+    parser.add_argument('--ttc_weight', type=float, default=1.0,
+                        help='Weight for Time‑to‑Collision penalty')
+    parser.add_argument('--safety_dist_weight', type=float, default=0.5,
+                        help='Weight for distance‑based safety penalty')
+    parser.add_argument('--angular_penalty', type=float, default=0.05,
+                        help='Penalty for angular velocity')
+    parser.add_argument('--angular_jerk_penalty', type=float, default=0.1,
+                        help='Penalty for angular jerk')
+    parser.add_argument('--step_penalty', type=float, default=0.02,
+                        help='Constant step penalty')
+    parser.add_argument('--idle_penalty', type=float, default=0.05,
+                        help='Penalty for low linear velocity')
+    
+    # Hyperparameter override
+    parser.add_argument('--learning_rate', type=float, default=None,
+                        help='Override learning rate (default depends on algorithm)')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Override batch size (default 256 for SAC/Tx-SAC)')
+    
+    # W&B
+    parser.add_argument('--wandb_project', type=str, default='tb3-nav-research',
+                        help='W&B project name')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='W&B run name (auto-generated if not provided)')
+    parser.add_argument('--wandb_mode', type=str, default='online',
+                        choices=['online', 'offline', 'disabled'])
+    parser.add_argument('--wandb_tags', type=str, nargs='+', default=[],
+                        help='Tags for W&B run')
+    
+    return parser.parse_args()
+
+
+# ============================================================
+# SEEDING
+# ============================================================
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-# ------------------------------------------------------------
-# Base env factory
-# ------------------------------------------------------------
+
+# ============================================================
+# BASE ENV FACTORY
+# ============================================================
 def make_base_env(hybrid: bool, env_type: str, gui: bool):
     if hybrid:
         return TB3HybridEnv(env_type=env_type, gui=gui)
     else:
         return TB3Env(env_type=env_type, gui=gui)
 
-# ------------------------------------------------------------
-# VecEnv factory for SubprocVecEnv
-# ------------------------------------------------------------
+
+# ============================================================
+# VEC ENV FACTORY FOR SUBPROC
+# ============================================================
 def make_env_fn(hybrid, seed, rank, algorithm, env_type, gui):
     def _init():
         env_seed = seed + rank
@@ -47,42 +127,180 @@ def make_env_fn(hybrid, seed, rank, algorithm, env_type, gui):
         return env
     return _init
 
-# ------------------------------------------------------------
-# Argument parsing
-# ------------------------------------------------------------
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--env_type', type=str, default='mixed')
-    parser.add_argument('--algorithm', type=str, default='sac',
-                        choices=['sac', 'ppo', 'lstm-sac', 'tx-sac', 'cnn-gru-sac'])
-    parser.add_argument('--hybrid', action='store_true', help='Use hybrid environment (with RRT waypoint)')
-    parser.add_argument('--total_timesteps', type=int, default=500000)
-    parser.add_argument('--eval_freq', type=int, default=10000)
-    parser.add_argument('--gui', action='store_true')
-    parser.add_argument('--gpu', action='store_true')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--num_envs', type=int, default=1)
-    parser.add_argument('--pretrained', type=str, default=None)
-    parser.add_argument('--exp_suffix', type=str, default='')
-    return parser.parse_args()
 
-# ------------------------------------------------------------
-# Main training
-# ------------------------------------------------------------
+# ============================================================
+# POLICY KWARGS FOR TEMPORAL MODELS
+# ============================================================
+def get_policy_kwargs(algorithm, feature_dim=256):
+    policy_kwargs = None
+    if algorithm == 'cnn-gru-sac':
+        try:
+            from policies.cnn_gru_extractor import SB3_CNNGRU_Extractor
+            policy_kwargs = dict(
+                features_extractor_class=SB3_CNNGRU_Extractor,
+                features_extractor_kwargs=dict(features_dim=feature_dim),
+                net_arch=dict(pi=[feature_dim], qf=[feature_dim])
+            )
+            print(f"[Policy] Using CNN-GRU extractor with features_dim={feature_dim}")
+        except ImportError:
+            print("WARNING: CNN-GRU extractor not found. Falling back to MLP.")
+            return None
+    elif algorithm == 'lstm-sac':
+        try:
+            from policies.lstm_extractor import SB3_LSTM_Extractor
+            policy_kwargs = dict(
+                features_extractor_class=SB3_LSTM_Extractor,
+                features_extractor_kwargs=dict(features_dim=feature_dim),
+                net_arch=dict(pi=[feature_dim], qf=[feature_dim])
+            )
+            print(f"[Policy] Using LSTM extractor with features_dim={feature_dim}")
+        except ImportError:
+            print("WARNING: LSTM extractor not found. Falling back to MLP.")
+            return None
+    elif algorithm == 'tx-sac':
+        try:
+            from policies.transformer_extractor import SB3_Transformer_Extractor
+            policy_kwargs = dict(
+                features_extractor_class=SB3_Transformer_Extractor,
+                features_extractor_kwargs=dict(features_dim=feature_dim),
+                net_arch=dict(pi=[feature_dim], qf=[feature_dim])
+            )
+            print(f"[Policy] Using Transformer extractor with features_dim={feature_dim}")
+        except ImportError:
+            print("WARNING: Transformer extractor not found. Falling back to MLP.")
+            return None
+    return policy_kwargs
+
+
+# ============================================================
+# GET GIT HASH
+# ============================================================
+def get_git_hash():
+    try:
+        result = subprocess.run(['git', 'rev-parse', 'HEAD'],
+                                capture_output=True, text=True, cwd=os.path.dirname(__file__))
+        if result.returncode == 0:
+            return result.stdout.strip()[:8]
+    except:
+        pass
+    return "unknown"
+
+
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     args = parse_args()
+    
     device = torch.device('cuda' if args.gpu and torch.cuda.is_available() else 'cpu')
+    print(f"[Device] Using: {device}")
     set_seed(args.seed)
-
+    
     import config
     config.ENV_TYPE = args.env_type
     config.GUI = args.gui
-
-    # ---------------- ENV CREATION ----------------
+    
+    # Push all reward parameters to environment variables for reward.py
+    os.environ['GOAL_REWARD'] = str(args.goal_reward)
+    os.environ['COLLISION_PENALTY'] = str(args.collision_penalty)
+    os.environ['PROGRESS_WEIGHT'] = str(args.progress_weight)
+    os.environ['TTC_WEIGHT'] = str(args.ttc_weight)
+    os.environ['SAFETY_DIST_WEIGHT'] = str(args.safety_dist_weight)
+    os.environ['ANGULAR_PENALTY'] = str(args.angular_penalty)
+    os.environ['ANGULAR_JERK_PENALTY'] = str(args.angular_jerk_penalty)
+    os.environ['STEP_PENALTY'] = str(args.step_penalty)
+    os.environ['IDLE_PENALTY'] = str(args.idle_penalty)
+    
+    print(f"[Reward] goal={args.goal_reward}, collision={args.collision_penalty}, "
+          f"progress={args.progress_weight}, ttc={args.ttc_weight}, "
+          f"safety_dist={args.safety_dist_weight}, angular={args.angular_penalty}, "
+          f"step={args.step_penalty}, idle={args.idle_penalty}")
+    
+    # ----------------------------------------------------------
+    # W&B INIT
+    # ----------------------------------------------------------
+    run_name = args.wandb_run_name or f"{args.env_type}_{args.algorithm}_{'hybrid' if args.hybrid else 'e2e'}_seed{args.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    git_hash = get_git_hash()
+    
+    # Default hyperparameters per algorithm
+    if args.algorithm == 'sac':
+        learning_rate = 3e-4
+        buffer_size = 300000
+        ent_coef = "auto_0.5"
+    elif args.algorithm == 'ppo':
+        learning_rate = 3e-4
+        buffer_size = None
+        ent_coef = 0.01
+    else:  # temporal models
+        learning_rate = 5e-5
+        buffer_size = 800000
+        ent_coef = 0.1
+    
+    batch_size = 256
+    if args.learning_rate is not None:
+        learning_rate = args.learning_rate
+    if args.batch_size is not None:
+        batch_size = args.batch_size
+    
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        mode=args.wandb_mode,
+        tags=args.wandb_tags,
+        config={
+            # Environment & algorithm
+            "env_type": args.env_type,
+            "algorithm": args.algorithm,
+            "hybrid": args.hybrid,
+            "total_timesteps": args.total_timesteps,
+            "eval_freq": args.eval_freq,
+            "seed": args.seed,
+            "num_envs": args.num_envs,
+            "pretrained": args.pretrained is not None,
+            "use_gpu": args.gpu,
+            "exp_suffix": args.exp_suffix,
+            # Reward parameters
+            "goal_reward": args.goal_reward,
+            "collision_penalty": args.collision_penalty,
+            "progress_weight": args.progress_weight,
+            "ttc_weight": args.ttc_weight,
+            "safety_dist_weight": args.safety_dist_weight,
+            "angular_penalty": args.angular_penalty,
+            "angular_jerk_penalty": args.angular_jerk_penalty,
+            "step_penalty": args.step_penalty,
+            "idle_penalty": args.idle_penalty,
+            # Hyperparameters
+            "learning_rate": learning_rate,
+            "batch_size": batch_size,
+            "buffer_size": buffer_size,
+            "gamma": 0.99,
+            "tau": 0.005,
+            "ent_coef": ent_coef,
+            # System
+            "device": str(device),
+            "git_commit": git_hash,
+            "python_version": sys.version[:50],
+            "torch_version": torch.__version__,
+        },
+        name=run_name,
+        sync_tensorboard=True,
+        monitor_gym=True,
+        save_code=True
+    )
+    
+    print(f"\n{'='*60}")
+    print(f"W&B Run: {wandb_run.name}")
+    print(f"W&B URL: {wandb_run.get_url()}")
+    print(f"{'='*60}\n")
+    
+    # ----------------------------------------------------------
+    # ENVIRONMENT CREATION
+    # ----------------------------------------------------------
+    print("[Env] Creating training environments...")
     if args.num_envs > 1:
         env_fns = [make_env_fn(args.hybrid, args.seed, i, args.algorithm, args.env_type, args.gui)
                    for i in range(args.num_envs)]
         env = SubprocVecEnv(env_fns)
+        print(f"[Env] Created {args.num_envs} parallel environments (SubprocVecEnv)")
     else:
         def _single_env():
             base = make_base_env(args.hybrid, args.env_type, args.gui)
@@ -91,10 +309,15 @@ def main():
                 base = TemporalObservationWrapper(base)
             return base
         env = DummyVecEnv([_single_env])
-
-    env = VecNormalize(env, norm_obs=True, norm_reward=False)
-
-    # ---------------- EVAL ENV ----------------
+        print("[Env] Created single environment (DummyVecEnv)")
+    
+    env = VecNormalize(env, norm_obs=True, norm_reward=True)
+    print("[Env] VecNormalize added (norm_obs=True, norm_reward=True)")
+    
+    # ----------------------------------------------------------
+    # EVALUATION ENVIRONMENT
+    # ----------------------------------------------------------
+    print("[Env] Creating evaluation environment...")
     def _eval_env():
         base = make_base_env(args.hybrid, args.env_type, args.gui)
         if args.algorithm in ['lstm-sac', 'tx-sac', 'cnn-gru-sac']:
@@ -105,348 +328,128 @@ def main():
     eval_env.norm_reward = False
     eval_env.obs_rms = env.obs_rms
     eval_env.training = False
-
-    # ---------------- MODEL NAME ----------------
+    
+    # ----------------------------------------------------------
+    # MODEL NAME & POLICY KWARGS
+    # ----------------------------------------------------------
     mode = "hybrid" if args.hybrid else "end2end"
     model_name = f'{args.env_type}_{args.algorithm}_{mode}_seed{args.seed}_{args.exp_suffix}'
-
-    # ---------------- POLICY KWARGS ----------------
+    print(f"[Model] Name: {model_name}")
+    
     policy_kwargs = None
-    if args.algorithm == 'cnn-gru-sac':
-        try:
-            from policies.cnn_gru_extractor import SB3_CNNGRU_Extractor
-            policy_kwargs = dict(
-                features_extractor_class=SB3_CNNGRU_Extractor,
-                features_extractor_kwargs=dict(features_dim=256),
-                net_arch=dict(pi=[256], qf=[256])
-            )
-        except ImportError:
-            print("WARNING: CNN-GRU extractor not found. Falling back to MLP.")
+    if args.algorithm in ['lstm-sac', 'tx-sac', 'cnn-gru-sac']:
+        policy_kwargs = get_policy_kwargs(args.algorithm)
+        if policy_kwargs is None:
+            print("[Policy] Falling back to SAC with MLP policy")
             args.algorithm = 'sac'
-    elif args.algorithm == 'lstm-sac':
-        try:
-            from policies.lstm_extractor import SB3_LSTM_Extractor
-            policy_kwargs = dict(
-                features_extractor_class=SB3_LSTM_Extractor,
-                features_extractor_kwargs=dict(features_dim=256),
-                net_arch=dict(pi=[256], qf=[256])
-            )
-        except ImportError:
-            print("WARNING: LSTM extractor not found. Falling back to MLP.")
-            args.algorithm = 'sac'
-    elif args.algorithm == 'tx-sac':
-        try:
-            from policies.transformer_extractor import SB3_Transformer_Extractor
-            policy_kwargs = dict(
-                features_extractor_class=SB3_Transformer_Extractor,
-                features_extractor_kwargs=dict(features_dim=256),
-                net_arch=dict(pi=[256], qf=[256])
-            )
-        except ImportError:
-            print("WARNING: Transformer extractor not found. Falling back to MLP.")
-            args.algorithm = 'sac'
-
-    # ---------------- MODEL CREATION ----------------
+    
+    # ----------------------------------------------------------
+    # MODEL CREATION
+    # ----------------------------------------------------------
+    print(f"[Model] Creating {args.algorithm} model...")
     if args.algorithm == 'sac':
-        model = SAC("MlpPolicy", env, learning_rate=3e-4, buffer_size=300000,
-                    batch_size=256, tau=0.005, gamma=0.99, ent_coef="auto_0.5",
-                    verbose=1, tensorboard_log=f"./tb_logs/{model_name}", device=device)
-    elif args.algorithm == 'ppo':
-        model = PPO("MlpPolicy", env, learning_rate=3e-4, n_steps=2048, batch_size=128,
-                    n_epochs=10, gamma=0.995, gae_lambda=0.95, clip_range=0.2,
-                    vf_coef=0.5, ent_coef=0.01,
-                    policy_kwargs=dict(net_arch=[256,256]), verbose=1,
-                    tensorboard_log=f"./tb_logs/{model_name}", device=device)
-    else:  # temporal models (LSTM, Transformer, CNN‑GRU)
-        # Stable hyperparameters for temporal models
         model = SAC("MlpPolicy", env,
-                    learning_rate=5e-5,
-                    buffer_size=800000,
-                    batch_size=256,
+                    learning_rate=learning_rate,
+                    buffer_size=300000,
+                    batch_size=batch_size,
                     tau=0.005,
                     gamma=0.99,
-                    ent_coef=0.1,
+                    ent_coef="auto_0.5",
+                    verbose=1,
+                    tensorboard_log=f"./tb_logs/{model_name}",
+                    device=device)
+    elif args.algorithm == 'ppo':
+        model = PPO("MlpPolicy", env,
+                    learning_rate=learning_rate,
+                    n_steps=2048,
+                    batch_size=batch_size if batch_size else 128,
+                    n_epochs=10,
+                    gamma=0.995,
+                    gae_lambda=0.95,
+                    clip_range=0.2,
+                    vf_coef=0.5,
+                    ent_coef=0.01,
+                    policy_kwargs=dict(net_arch=[256,256]),
+                    verbose=1,
+                    tensorboard_log=f"./tb_logs/{model_name}",
+                    device=device)
+    else:  # temporal models
+        model = SAC("MlpPolicy", env,
+                    learning_rate=learning_rate,
+                    buffer_size=buffer_size,
+                    batch_size=batch_size,
+                    tau=0.005,
+                    gamma=0.99,
+                    ent_coef=ent_coef,
                     policy_kwargs=policy_kwargs,
                     verbose=1,
                     tensorboard_log=f"./tb_logs/{model_name}",
                     device=device)
-
+    
     if args.pretrained and os.path.isfile(args.pretrained):
         model.set_parameters(args.pretrained)
-
-    # ---------------- TRAIN ----------------
-    eval_callback = EvalCallback(eval_env, best_model_save_path=f"./models/{model_name}",
-                                 log_path=f"./logs/{model_name}", eval_freq=args.eval_freq,
-                                 deterministic=True)
-    model.learn(total_timesteps=args.total_timesteps, callback=eval_callback)
-    print(f"Training finished. Best model saved in ./models/{model_name}")
-
-    # ---------------- SAVE FINAL MODEL ----------------
+        wandb_run.config.update({"pretrained_model": args.pretrained}, allow_val_change=True)
+        print(f"[Model] Loaded pretrained weights from {args.pretrained}")
+    
+    # ----------------------------------------------------------
+    # CALLBACKS
+    # ----------------------------------------------------------
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=f"./models/{model_name}",
+        log_path=f"./logs/{model_name}",
+        eval_freq=args.eval_freq,
+        deterministic=True,
+        verbose=1
+    )
+    wandb_callback = WandbCallback(
+        verbose=2,
+        model_save_path=f"./models/{model_name}",
+        model_save_freq=args.eval_freq,
+        gradient_save_freq=1000
+    )
+    
+    # ----------------------------------------------------------
+    # TRAINING
+    # ----------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"Starting training: {model_name}")
+    print(f"Total timesteps: {args.total_timesteps:,}")
+    print(f"Evaluation frequency: {args.eval_freq:,} steps")
+    print(f"{'='*60}\n")
+    
+    model.learn(
+        total_timesteps=args.total_timesteps,
+        callback=[eval_callback, wandb_callback]
+    )
+    
+    print(f"\n✅ Training finished. Best model saved in ./models/{model_name}")
+    
+    # ----------------------------------------------------------
+    # SAVE FINAL MODEL
+    # ----------------------------------------------------------
     model_dir = f"./models/{model_name}_final"
     os.makedirs(model_dir, exist_ok=True)
     model.save(os.path.join(model_dir, "model.zip"))
     env.save(os.path.join(model_dir, "vecnormalize.pkl"))
+    print(f"[Model] Final model saved to {model_dir}")
+    
+    model_artifact = wandb.Artifact('trained_model', type='model')
+    model_artifact.add_file(os.path.join(model_dir, "model.zip"))
+    wandb_run.log_artifact(model_artifact)
+    print("[W&B] Model artifact uploaded")
+    
+    wandb_run.summary["final_model_path"] = model_dir
+    wandb_run.summary["total_timesteps"] = args.total_timesteps
+    wandb_run.finish()
+    print(f"\n✅ W&B run finished. View results at: {wandb_run.get_url()}")
 
-if __name__ == "__main__":
-    main()(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ 
-
-cat eval.py:
-
-# Fully Corrected eval.py
-# Works with both old Gym (4‑value step) and Gymnasium (5‑value step)
-# Compatible with end‑to‑end and hybrid environments, with or without temporal wrappers.
-
-import argparse
-import os
-import csv
-import time
-import random
-import numpy as np
-import torch
-import gym
-
-from stable_baselines3 import SAC, PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-
-from env.tb3_env import TB3Env
-from env.tb3_env_hybrid import TB3HybridEnv
-from env.observation_wrapper import TemporalObservationWrapper
-
-from config import (
-    OBSERVATION_HISTORY, GOAL_THRESHOLD, COLLISION_DIST,
-    LIDAR_RANGE, ANGULAR_VEL
-)
-
-# ------------------------------------------------------------
-# Seeding for reproducibility
-# ------------------------------------------------------------
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-# ------------------------------------------------------------
-# Base environment factory
-# ------------------------------------------------------------
-def make_base_env(hybrid: bool, env_type: str, gui: bool):
-    """Create the appropriate base environment (TB3Env or TB3HybridEnv)."""
-    if hybrid:
-        return TB3HybridEnv(env_type=env_type, gui=gui)
-    else:
-        return TB3Env(env_type=env_type, gui=gui)
-
-# ------------------------------------------------------------
-# Unwrap VecNormalize → DummyVecEnv → underlying base env
-# ------------------------------------------------------------
-def unwrap_original_env(env):
-    """
-    Recursively unwrap VecNormalize and DummyVecEnv to access the original
-    TB3Env or TB3HybridEnv instance. Needed to call get_robot_pose(), get_lidar(), etc.
-    """
-    if isinstance(env, VecNormalize):
-        env = env.venv
-    if isinstance(env, DummyVecEnv):
-        env = env.envs[0]
-    while hasattr(env, "env"):
-        env = env.env
-    return env
-
-# ------------------------------------------------------------
-# Argument parsing
-# ------------------------------------------------------------
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, required=True,
-                        help="Path to the trained model .zip file")
-    parser.add_argument('--env_type', type=str, default='mixed',
-                        choices=['static', 'mixed', 'dense'])
-    parser.add_argument('--algorithm', type=str, required=True,
-                        choices=['sac', 'ppo', 'cnn-gru-sac', 'lstm-sac', 'tx-sac'])
-    parser.add_argument('--hybrid', action='store_true',
-                        help="Use hybrid environment (RRT + waypoint)")
-    parser.add_argument('--num_episodes', type=int, default=50)
-    parser.add_argument('--gui', action='store_true',
-                        help="Show PyBullet GUI")
-    parser.add_argument('--output', type=str, default='eval_results.csv')
-    parser.add_argument('--seed', type=int, default=42)
-    return parser.parse_args()
-
-# ------------------------------------------------------------
-# Main evaluation
-# ------------------------------------------------------------
-def main():
-    args = parse_args()
-    set_seed(args.seed)
-
-    # Update global config (used by environments)
-    import config
-    config.ENV_TYPE = args.env_type
-    config.GUI = args.gui
-
-    # ---------------- CREATE BASE ENVIRONMENT ----------------
-    base_env = make_base_env(args.hybrid, args.env_type, args.gui)
-    if args.algorithm in ['cnn-gru-sac', 'lstm-sac', 'tx-sac']:
-        # Wrap with TemporalObservationWrapper to stack history
-        base_env = TemporalObservationWrapper(base_env)
-    env = DummyVecEnv([lambda: base_env])
-
-    # ---------------- LOAD NORMALIZATION STATS ----------------
-    norm_path = os.path.join(os.path.dirname(args.model_path), "vecnormalize.pkl")
-    if os.path.exists(norm_path):
-        try:
-            env = VecNormalize.load(norm_path, env)
-            env.training = False      # disable updates
-            env.norm_reward = False   # we want raw rewards for metrics
-            print(f"Loaded VecNormalize stats from {norm_path}")
-        except Exception as e:
-            print(f"Warning: VecNormalize load failed ({e}). Running without normalization.")
-    else:
-        print("Warning: No VecNormalize stats found.")
-
-    # ---------------- LOAD TRAINED MODEL ----------------
-    if args.algorithm in ['sac', 'cnn-gru-sac', 'lstm-sac', 'tx-sac']:
-        model = SAC.load(args.model_path, env=env)
-    else:  # PPO
-        model = PPO.load(args.model_path, env=env)
-
-    metrics = []
-
-    # ---------------- EVALUATION LOOP ----------------
-    for ep in range(args.num_episodes):
-        obs = env.reset()
-        original_env = unwrap_original_env(env)
-
-        # Record start and goal positions
-        start_pos = np.array(original_env.get_robot_pose()[:2])
-        goal_pos = np.array(original_env.goal_pos[:2])
-        straight_line_dist = np.linalg.norm(goal_pos - start_pos)
-
-        done = False
-        steps = 0
-        path_length = 0.0
-        prev_pos = start_pos.copy()
-        collision = False
-        dynamic_collision = False
-        success = False
-        angular_velocities = []
-        min_distances = []
-        stuck_counter = 0
-        stuck_events = 0
-        start_time = time.time()
-
-        while not done:
-            # Get action from policy (deterministic for evaluation)
-            action, _ = model.predict(obs, deterministic=True)
-
-            # Record angular velocity for smoothness metric
-            ang_vel = action[0][1] * ANGULAR_VEL
-            angular_velocities.append(ang_vel)
-
-            # ---------- CRITICAL FIX: handle both 4-value and 5-value step ----------
-            step_result = env.step(action)
-            if len(step_result) == 5:          # Gymnasium style
-                obs, reward, terminated, truncated, info = step_result
-                done = terminated or truncated
-            else:                              # Old Gym style (4 values)
-                obs, reward, done, info = step_result
-            # ------------------------------------------------------------------------
-
-            steps += 1
-
-            # Get current robot position (x, y)
-            curr_pos = np.array(original_env.get_robot_pose()[:2])
-
-            # Path length (Euclidean distance travelled)
-            step_dist = np.linalg.norm(curr_pos - prev_pos)
-            path_length += step_dist
-            prev_pos = curr_pos
-
-            # Stuck detection: if robot moves less than 1 cm for 50 steps
-            if step_dist < 0.01:
-                stuck_counter += 1
-            else:
-                stuck_counter = 0
-            if stuck_counter >= 50:
-                stuck_events += 1
-                stuck_counter = 0
-
-            # LiDAR clearance (minimum distance to any obstacle)
-            raw_lidar = np.array(original_env.get_lidar(), dtype=np.float32)
-            raw_lidar = np.clip(raw_lidar, 0.0, 1.0)
-            min_dist = np.min(raw_lidar) * LIDAR_RANGE
-            min_distances.append(min_dist)
-
-   
-            # Collision detection – info is a list of dicts (VecEnv)
-                       
-            if isinstance(info, list) and len(info) > 0:
-                # For DummyVecEnv, info[0] contains the dict for the single environment
-                env_info = info[0]
-                if env_info.get('collision', False):
-                    collision = True
-                    # Also check dynamic collision if needed
-                    try:
-                        dyn_dists = original_env.get_dynamic_obstacle_distances()
-                        if dyn_dists and min(dyn_dists) < COLLISION_DIST:
-                            dynamic_collision = True
-                    except AttributeError:
-                        pass
-
-        # Episode finished – compute metrics
-        time_to_goal = time.time() - start_time
-        jerk = np.mean(np.abs(np.diff(angular_velocities))) if len(angular_velocities) > 1 else 0.0
-        min_clearance = np.min(min_distances) if min_distances else 0.0
-        path_efficiency = straight_line_dist / path_length if path_length > 0 else 0.0
-
-        # Success if reached goal without collision
-        if not collision:
-            dist_to_goal = np.linalg.norm(curr_pos - goal_pos)
-            if dist_to_goal < GOAL_THRESHOLD:
-                success = True
-
-        # Store episode results
-        metrics.append({
-            'episode': ep,
-            'steps': steps,
-            'time_to_goal': time_to_goal,
-            'path_length': path_length,
-            'path_efficiency': path_efficiency,
-            'smoothness_jerk': jerk,
-            'min_clearance': min_clearance,
-            'collision': collision,
-            'dynamic_collision': dynamic_collision,
-            'stuck_events': stuck_events,
-            'success': success
-        })
-
-        print(f"Episode {ep}: success={success}, steps={steps}, "
-              f"time={time_to_goal:.2f}s, eff={path_efficiency:.2f}, "
-              f"jerk={jerk:.3f}, clearance={min_clearance:.2f}")
-
-    # ---------------- SAVE RESULTS TO CSV ----------------
-    with open(args.output, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
-        writer.writeheader()
-        writer.writerows(metrics)
-
-    # ---------------- PRINT SUMMARY ----------------
-    success_rate = np.mean([m['success'] for m in metrics]) * 100
-    collision_rate = np.mean([m['collision'] for m in metrics]) * 100
-    dynamic_collision_rate = np.mean([m['dynamic_collision'] for m in metrics]) * 100
-    avg_steps = np.mean([m['steps'] for m in metrics])
-    avg_eff = np.mean([m['path_efficiency'] for m in metrics])
-
-    print("\n===== Evaluation Summary =====")
-    print(f"Success rate: {success_rate:.1f}%")
-    print(f"Collision rate: {collision_rate:.1f}% (dynamic: {dynamic_collision_rate:.1f}%)")
-    print(f"Average steps: {avg_steps:.1f}")
-    print(f"Path efficiency: {avg_eff:.2f}")
-    print(f"Results saved to {args.output}")
 
 if __name__ == "__main__":
     main()
-
-cat env/tb3_env.py:
+ cat env/tb3_env.py 
+# env/tb3_env.py – COMPLETE CORRECTED VERSION
+# Uses the same RewardCalculator as TB3HybridEnv for consistency
 
 import gym
 import numpy as np
@@ -455,7 +458,7 @@ import pybullet_data
 import random
 import time
 from gym import spaces
-
+import config
 from config import (
     TIME_STEP, MAX_STEPS, NUM_LIDAR, LIDAR_RANGE, LIDAR_OFFSET,
     GOAL_THRESHOLD, COLLISION_DIST, LINEAR_VEL, ANGULAR_VEL,
@@ -463,8 +466,16 @@ from config import (
     GUI
 )
 
+# Import the same RewardCalculator used by TB3HybridEnv
+from env.reward import RewardCalculator
+
+
 class TB3Env(gym.Env):
-    """Base TurtleBot3 environment – Gymnasium compatible (5‑value step)."""
+    """Base TurtleBot3 environment – Gymnasium compatible (5‑value step).
+    
+    Uses the same RewardCalculator as TB3HybridEnv for consistent reward
+    computation across end-to-end and hybrid architectures.
+    """
 
     def __init__(self, env_type=ENV_TYPE, gui=GUI):
         super().__init__()
@@ -489,6 +500,9 @@ class TB3Env(gym.Env):
         self.prev_dist_to_goal = None
         self.goal_pos = np.array([1.5, 1.5, 0.0])
 
+        # ========== USE SAME REWARD CALCULATOR AS HYBRID ==========
+        self.reward_calc = RewardCalculator()
+
         # Build world (will be fully reset in reset)
         self._load_world()
         self._load_robot()
@@ -505,7 +519,7 @@ class TB3Env(gym.Env):
         self.LIDAR_RANGE = LIDAR_RANGE
 
     # ------------------------------------------------------------------
-    # Setup methods (unchanged, same as before)
+    # Setup methods
     # ------------------------------------------------------------------
     def _load_world(self):
         p.resetSimulation()
@@ -584,6 +598,7 @@ class TB3Env(gym.Env):
         self.step_count = 0
         self._load_world()
         self._load_robot()
+        
         # Random goal (avoid too close to start)
         while True:
             gx = random.uniform(-2.5, 2.5)
@@ -603,14 +618,19 @@ class TB3Env(gym.Env):
                                           p.getQuaternionFromEuler([0,0,yaw]))
 
         # Settling loop
-        for _ in range(240):
+        for _ in range(20):
             p.stepSimulation()
             if self.gui:
                 time.sleep(TIME_STEP)
 
+        # Initialize distance tracking
         self.prev_dist_to_goal = self._distance_to_goal()
+        
+        # Reset reward calculator's internal state for new episode
+        self.reward_calc.reset_step_count()
+        
         obs = self._get_observation()
-        info = {}   # no additional info
+        info = {}
         return obs, info
 
     def step(self, action):
@@ -635,25 +655,58 @@ class TB3Env(gym.Env):
             if self.gui:
                 time.sleep(TIME_STEP)
 
-        obs = self._get_observation()
-        reward, done = self._compute_reward(action)
-
+        # Get current state for reward computation
         robot_pose = self._get_robot_pose()
+        lidar = self._get_lidar()
+        collision = self._check_collision()
+        reached_goal = self._check_goal()
+        
+        # For end-to-end, we don't have a waypoint. Use goal distance as pseudo-waypoint.
+        # This ensures the reward calculator receives valid inputs.
+        curr_dist_to_goal = self._distance_to_goal()
+        
+        # For waypoint distance, use goal distance (end-to-end has no waypoint)
+        # This makes the waypoint progress reward effectively zero since both are same.
+        curr_dist_to_wp = curr_dist_to_goal
+        
+        if self.prev_dist_to_goal is None:
+            self.prev_dist_to_goal = curr_dist_to_goal
+
+        # ========== USE THE SAME REWARD CALCULATOR AS HYBRID ==========
+        reward, done = self.reward_calc.compute(
+            prev_wp_dist=self.prev_dist_to_goal,  # Reuse goal distance as pseudo-waypoint
+            curr_wp_dist=curr_dist_to_wp,
+            robot_pose=robot_pose,
+            path=None,  # No path in end-to-end
+            collision=collision,
+            reached_goal=reached_goal,
+            action=action,
+            lidar_scan=lidar,
+            goal_xy=self.goal_pos[:2]
+        )
+
+        # World bounds check
         x, y = robot_pose[0], robot_pose[1]
         if x < -3.5 or x > 3.5 or y < -3.5 or y > 3.5:
-            reward -= 2.0          # penalty for leaving the world
+            reward -= 2.0
             print("Out of bounds! reward -2.0")
-            done = True            # terminate episode
+            done = True
 
-        # Gymnasium: terminated = episode ended (goal/collision), truncated = max steps
+        # Update state for next step
+        self.prev_dist_to_goal = curr_dist_to_goal
+
+        # Gymnasium termination logic
         terminated = done and not (self.step_count >= MAX_STEPS)
         truncated = (self.step_count >= MAX_STEPS) and not done
-        info = {"collision": self._check_collision(), "reached_goal": self._check_goal()}
+        info = {"collision": collision, "reached_goal": reached_goal}
+        
+        obs = self._get_observation()
         return obs, reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
-    # Helper methods (unchanged)
+    # Helper methods
     # ------------------------------------------------------------------
+        
     def _get_observation(self):
         lidar = self._get_lidar()
         v, w = self._get_robot_velocity()
@@ -688,40 +741,8 @@ class TB3Env(gym.Env):
     def _check_goal(self):
         return self._distance_to_goal() < GOAL_THRESHOLD
 
-   # ---------------- REWARD ----------------
-    def _compute_reward(self, action):
-        curr_dist = self._distance_to_goal()
-
-        # CLAMPED PROGRESS
-        progress = max(0.0, self.prev_dist_to_goal - curr_dist)
-
-        reward = 6.0 * progress
-        reward += 0.2 * max(0, action[0])
-        reward -= 0.05 * abs(action[1])
-        reward -= 0.02  # time penalty
-
-        done = False
-
-        if self._check_collision():
-            reward -= 150
-            print("Collision! reward -150")
-            done = True
-
-        elif self._check_goal():
-            reward += 300
-            print("Goal reached! +300")
-            done = True
-        elif self.step_count >= MAX_STEPS:
-            print(f"Max steps reached: {self.step_count} >= {MAX_STEPS}")
-            done = True
-
-        self.prev_dist_to_goal = curr_dist
-
-        return reward, done
-   
-      
     # ------------------------------------------------------------------
-    # Public methods (unchanged)
+    # Public methods (for evaluation and debugging)
     # ------------------------------------------------------------------
     def get_robot_pose(self):
         return self._get_robot_pose()
@@ -756,15 +777,17 @@ class TB3Env(gym.Env):
             p1 = [path[i+1][0], path[i+1][1], z]
             p.addUserDebugLine(p0, p1, lineColorRGB=color, lineWidth=2.0)
 
-cat env/tb3_env_hybrid.py:
-
+ cat env/tb3_env_hybrid.py 
+# env/tb3_hybrid.py
 import numpy as np
 import pybullet as p
 import time
 import random
+
 from env.tb3_env import TB3Env
-from env.reward1 import RewardCalculator
+from env.reward import RewardCalculator           # FIXED: use reward.py
 from env.planners import RRTPlanner
+
 from config import (
     LINEAR_VEL, ANGULAR_VEL, WHEEL_BASE, WHEEL_RADIUS, TIME_STEP,
     PLANNER_UPDATE_FREQ, WAYPOINT_DISTANCE, LIDAR_RANGE,
@@ -772,50 +795,79 @@ from config import (
 )
 
 class TB3HybridEnv(TB3Env):
-    """Hybrid environment: RRT global planner + waypoint tracking + hybrid reward."""
+    """
+    Hybrid Navigation Environment:
+    - Global planner (RRT) for waypoint generation
+    - DRL local policy with observation including waypoint vector
+    """
 
     def __init__(self, env_type="static", gui=False):
         super().__init__(env_type=env_type, gui=gui)
-        self.planner = RRTPlanner(static_obstacles=STATIC_OBSTACLES,
-                                  bounds=self.world_bounds)
+
+        self.planner = RRTPlanner(
+            static_obstacles=STATIC_OBSTACLES,
+            bounds=self.world_bounds
+        )
+
+        # Path + waypoint
         self.path = None
         self.path_index = 0
         self.current_waypoint = None
         self.wp_threshold = 0.2
+
+        # Planner control
         self.planner_counter = 0
+
+        # Distance tracking for reward
         self.prev_dist_to_wp = None
+
+        # Reward calculator (corrected version)
         self.reward_calc = RewardCalculator()
 
+        # Visitation penalty (anti‑looping)
+        self.visited_cells = {}
+        self.cell_size = 0.5
+
+    # ==========================================================
+    # RESET
+    # ==========================================================
     def reset(self, *, seed=None, options=None):
-        """Reset environment, accept seed and options, return (obs, info)."""
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
 
-        # Call base reset (returns obs, info – we ignore obs)
-        super().reset(seed=seed, options=options)
+        obs, info = super().reset(seed=seed, options=options)
 
+        # Reset planner state
         self.planner_counter = 0
         self.path_index = 0
         self.current_waypoint = None
+
         self._plan_global_path()
+
         robot_pose = self.get_robot_pose()
         self._update_waypoint(robot_pose, linear_velocity=0.0)
-        self.prev_dist_to_wp = self._distance_to_waypoint()
+
+        # Initialise distance to waypoint
+        self.prev_dist_to_wp = float(self._distance_to_waypoint())
+
+        # Reset visitation
+        self.visited_cells.clear()
 
         obs = self._get_hybrid_observation()
-        info = {}
         return obs, info
 
+    # ==========================================================
+    # STEP
+    # ==========================================================
     def step(self, action):
-        """Take action, return (obs, reward, terminated, truncated, info)."""
         self.step_count += 1
         self.planner_counter += 1
 
-        # Apply action using base wheel control
+        # ---- Apply action (same as before) ----
         action = np.clip(action, -1.0, 1.0)
-        linear = action[0] * LINEAR_VEL
-        angular = action[1] * ANGULAR_VEL
+        linear = float(action[0]) * LINEAR_VEL
+        angular = float(action[1]) * ANGULAR_VEL
         left = (linear - (WHEEL_BASE/2.0)*angular) / WHEEL_RADIUS
         right = (linear + (WHEEL_BASE/2.0)*angular) / WHEEL_RADIUS
         p.setJointMotorControl2(self.robot_id, self.left_wheel, p.VELOCITY_CONTROL,
@@ -823,14 +875,14 @@ class TB3HybridEnv(TB3Env):
         p.setJointMotorControl2(self.robot_id, self.right_wheel, p.VELOCITY_CONTROL,
                                 targetVelocity=right, force=2.0)
 
-        # Step physics (8 sub‑steps)
+        # ---- Simulation steps ----
         for _ in range(8):
             p.stepSimulation()
             self._update_dynamic_obstacles()
             if self.gui:
                 time.sleep(TIME_STEP)
 
-        # Replan RRT periodically
+        # ---- Replan global path occasionally ----
         if self.planner_counter % PLANNER_UPDATE_FREQ == 0:
             self._plan_global_path()
 
@@ -838,16 +890,24 @@ class TB3HybridEnv(TB3Env):
         linear_vel, _ = self.get_robot_velocity()
         self._update_waypoint(robot_pose, linear_vel)
 
-        curr_dist_to_wp = self._distance_to_waypoint()
+        # ---- Distances ----
+        curr_dist_to_wp = float(self._distance_to_waypoint())
         if self.prev_dist_to_wp is None:
             self.prev_dist_to_wp = curr_dist_to_wp
 
+        # ---- Terminal conditions ----
         collision = self._check_collision()
         reached_goal = self._check_goal()
         lidar = self.get_lidar()
 
-        
+        # ========== COLLECT DYNAMIC OBSTACLE DATA ==========
+        dyn_positions = []
+        dyn_velocities = []
+        for obs in self.dynamic_obstacles:
+            dyn_positions.append(obs['pos'])          # [x, y, z]
+            dyn_velocities.append(obs['vel'])         # [vx, vy, vz]
 
+        # ========== COMPUTE REWARD WITH TTC ==========
         reward, done = self.reward_calc.compute(
             prev_wp_dist=self.prev_dist_to_wp,
             curr_wp_dist=curr_dist_to_wp,
@@ -857,54 +917,70 @@ class TB3HybridEnv(TB3Env):
             reached_goal=reached_goal,
             action=action,
             lidar_scan=lidar,
-            goal_xy=self.goal_pos[:2]   
+            goal_xy=self.goal_pos[:2],
+            dynamic_obs_positions=dyn_positions,
+            dynamic_obs_velocities=dyn_velocities
         )
 
+        # ---- World bounds penalty ----
+        x, y = robot_pose[0], robot_pose[1]
+        if x < -3.5 or x > 3.5 or y < -3.5 or y > 3.5:
+            reward -= 2.0
+            done = True
+
+        # ---- Visitation penalty (prevents loops) ----
+        cell = (int(x / self.cell_size), int(y / self.cell_size))
+        self.visited_cells[cell] = self.visited_cells.get(cell, 0) + 1
+        if self.visited_cells[cell] > 3:
+            reward -= min(0.05 * self.visited_cells[cell], 1.0)
+
+        # ---- Update internal state ----
         self.prev_dist_to_wp = curr_dist_to_wp
 
-        # Determine termination and truncation
-        terminated = done and not (self.step_count >= MAX_STEPS)
-        truncated = (self.step_count >= MAX_STEPS) and not done
+        # ---- Termination handling (Gymnasium) ----
+        terminated = bool(done)
+        truncated = bool(self.step_count >= MAX_STEPS)
+        if terminated:
+            print(f"Episode terminated: collision={collision}, reached_goal={reached_goal}, reward={reward:.2f}")
+            truncated = False
 
+        # ---- Observation ----
         obs = self._get_hybrid_observation()
-        info = {"collision": collision, "reached_goal": reached_goal}
+        info = {
+            "collision": collision,
+            "reached_goal": reached_goal,
+            "distance_to_goal": np.linalg.norm(robot_pose[:2] - self.goal_pos[:2]),
+            "waypoint_distance": curr_dist_to_wp
+        }
+
         return obs, reward, terminated, truncated, info
-
-    # ------------------------------------------------------------------
-    # Public wrappers (already in base, but re‑exposed for clarity)
-    # ------------------------------------------------------------------
-    def get_robot_pose(self):
-        return self._get_robot_pose()
-
-    def get_robot_velocity(self):
-        return self._get_robot_velocity()
-
-    def get_lidar(self):
-        return self._get_lidar()
-
-    # ------------------------------------------------------------------
-    # Hybrid observation (waypoint relative)
-    # ------------------------------------------------------------------
+   # ==========================================================
+    # OBSERVATION (waypoint guidance)
+    # ==========================================================
     def _get_hybrid_observation(self):
         lidar = self.get_lidar()
         v, w = self.get_robot_velocity()
+
         if self.current_waypoint is None:
             dx, dy = 0.0, 0.0
         else:
             robot_xy = self.get_robot_pose()[:2]
             dx = self.current_waypoint[0] - robot_xy[0]
             dy = self.current_waypoint[1] - robot_xy[1]
+
         dist = np.hypot(dx, dy)
-        norm = WAYPOINT_DISTANCE
+        # Normalise by WAYPOINT_DISTANCE (e.g., 1.0 m)
+        norm = WAYPOINT_DISTANCE + 1e-6
         dx = np.clip(dx / norm, -1, 1)
         dy = np.clip(dy / norm, -1, 1)
-        dist = np.clip(dist / norm, -1, 1)
+        dist = np.clip(dist / norm, 0, 1)
+
         obs = np.concatenate([lidar, [v, w], [dx, dy, dist]]).astype(np.float32)
         return obs
 
-    # ------------------------------------------------------------------
-    # RRT and waypoint logic (unchanged)
-    # ------------------------------------------------------------------
+    # ==========================================================
+    # PLANNER
+    # ==========================================================
     def _plan_global_path(self):
         start = self.get_robot_pose()[:2]
         goal = self.goal_pos[:2]
@@ -917,45 +993,51 @@ class TB3HybridEnv(TB3Env):
         elif self.path is None:
             self.path = [start, goal]
 
+    # ==========================================================
+    # WAYPOINT LOGIC
+    # ==========================================================
     def _update_waypoint(self, robot_pose, linear_velocity):
         if self.path is None or len(self.path) < 2:
             self.current_waypoint = self.goal_pos[:2]
             return
 
         robot_xy = robot_pose[:2]
-        lookahead = 0.2 + 2.0 * max(0.0, linear_velocity)
+
+        # Adaptive lookahead (adjusted slightly)
+        lookahead = 0.3 + 1.5 * max(0.0, linear_velocity)
         lidar = self.get_lidar()
         clearance = np.min(lidar) * LIDAR_RANGE
-        if clearance < 0.5:
-            lookahead = max(0.3, lookahead * 0.5)
+        if clearance < 0.4:
+            lookahead *= 0.5
         elif clearance > 1.0:
-            lookahead = min(0.8, lookahead * 1.2)
+            lookahead *= 1.2
+        lookahead = np.clip(lookahead, 0.2, 0.8)
 
-        while self.path_index < len(self.path)-1:
+        # Advance path index when close to current waypoint
+        while self.path_index < len(self.path) - 1:
             if np.linalg.norm(robot_xy - self.path[self.path_index]) < self.wp_threshold:
                 self.path_index += 1
             else:
                 break
 
+        # Select waypoint based on lookahead
         new_wp = self.path[-1]
         for i in range(self.path_index, len(self.path)):
             if np.linalg.norm(robot_xy - self.path[i]) > lookahead:
                 new_wp = self.path[i]
                 break
+        self.current_waypoint = new_wp
 
-        if self.current_waypoint is None or np.linalg.norm(self.current_waypoint - new_wp) > 0.05:
-            self.current_waypoint = new_wp
-
+    # ==========================================================
+    # DISTANCE TO WAYPOINT
+    # ==========================================================
     def _distance_to_waypoint(self):
-        
         if self.current_waypoint is None:
             return 0.0
         robot_xy = self.get_robot_pose()[:2]
-        return float(np.linalg.norm(robot_xy - self.current_waypoint))
-    
+        return float(np.linalg.norm(robot_xy - self.current_waypoint))rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ 
 
-    
-(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ cat env/lidar.py env/reward env/observation_wrapper.py
+ cat env/lidar.py env/observation_wrapper.py env/reward.py
 import pybullet as p
 import numpy as np
 from config import LIDAR_RANGE, LIDAR_OFFSET, NUM_LIDAR, LIDAR_NOISE_STD, LIDAR_DROPOUT_RATE
@@ -1022,8 +1104,7 @@ def get_lidar_scan(robot_id, num_rays=NUM_LIDAR, max_distance=LIDAR_RANGE,
         distances[dropout] = 1.0
     # -----------------------------------------------
 
-    return distancescat: env/reward: No such file or directory
-from collections import deque
+    return distancesfrom collections import deque
 import numpy as np
 import gym
 
@@ -1055,9 +1136,263 @@ class TemporalObservationWrapper(gym.Wrapper):
         return self._get_obs(), reward, terminated, truncated, info
 
     def _get_obs(self):
-        return np.concatenate(list(self.buffer), axis=0)(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ 
+        return np.concatenate(list(self.buffer), axis=0)# env/reward.py – Final: works with original action mapping (forward+backward)
+# Forward bonus, backward penalty, idle penalty, gated progress
 
-(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ cat env/planners.py env/controllers.py 
+import os
+import numpy as np
+from config import MAX_STEPS
+
+class RewardCalculator:
+    def __init__(self):
+        # Terminal rewards
+        self.goal_reward = float(os.environ.get("GOAL_REWARD", 200.0))
+        self.collision_penalty = float(os.environ.get("COLLISION_PENALTY", 80.0))
+        self.timeout_penalty = float(os.environ.get("TIMEOUT_PENALTY", 30.0))
+        
+        # Internal state
+        self.prev_wp_dist = None
+        self.step_count = 0
+        
+        print(f"[FINAL Reward] goal={self.goal_reward}, collision={self.collision_penalty}, timeout={self.timeout_penalty}")
+    
+
+    def reset_step_count(self):
+        """Reset the step counter for a new episode."""
+        self.step_count = 0
+        
+    def compute(self,
+                prev_wp_dist,
+                curr_wp_dist,
+                robot_pose,
+                path,
+                collision,
+                reached_goal,
+                action,
+                lidar_scan,
+                goal_xy,
+                dynamic_obs_positions=None,
+                dynamic_obs_velocities=None):
+
+        reward = 0.0
+        done = False
+
+        progress = prev_wp_dist - curr_wp_dist
+
+        # Pure progress reward
+        reward += 10.0 * progress
+
+        # Goal
+        if reached_goal:
+            reward += 200.0
+            done = True
+
+        # Collision
+        if collision:
+            reward -= 80.0
+            done = True
+
+        return reward, done
+
+cat policies/transformer_extractor.py policies/lstm_extractor.py policies/cnn_gru_extractor.py 
+import torch
+import torch.nn as nn
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from config import OBSERVATION_HISTORY, NUM_LIDAR
+
+class SB3_Transformer_Extractor(BaseFeaturesExtractor):
+    """
+    Spatio‑temporal feature extractor:
+    - 1D CNN per LiDAR scan (spatial)
+    - Transformer over time (temporal)
+    - Concatenates other features at each timestep
+    """
+    def __init__(self, observation_space, features_dim=256, n_heads=4, n_layers=2):
+        super().__init__(observation_space, features_dim)
+
+        self.history = OBSERVATION_HISTORY
+        self.lidar_dim = NUM_LIDAR
+        self.other_dim = observation_space.shape[0] // self.history - self.lidar_dim
+
+        # Spatial encoder (CNN)
+        self.cnn = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        cnn_out = 32 * self.lidar_dim
+
+        # Project combined features to transformer dimension (e.g., 64)
+        self.proj = nn.Linear(cnn_out + self.other_dim, 64)
+
+        # Positional encoding (learnable)
+        self.pos_encoding = nn.Parameter(torch.randn(1, self.history, 64))
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=64,
+            nhead=n_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Final projection to features_dim
+        self.fc = nn.Linear(64, features_dim)
+
+    def forward(self, observations):
+        batch = observations.shape[0]
+        seq = observations.view(batch, self.history, self.lidar_dim + self.other_dim)
+
+        lidar_seq = seq[:, :, :self.lidar_dim]
+        other_seq = seq[:, :, self.lidar_dim:]
+
+        # CNN per timestep
+        bh = batch * self.history
+        lidar_flat = lidar_seq.reshape(bh, 1, self.lidar_dim)
+        cnn_out = self.cnn(lidar_flat)
+        cnn_out = cnn_out.reshape(batch, self.history, -1)
+
+        # Combine with other features
+        combined = torch.cat([cnn_out, other_seq], dim=2)   # (B, H, cnn_out+other_dim)
+
+        # Project to transformer dimension
+        x = self.proj(combined)                            # (B, H, 64)
+        x = x + self.pos_encoding
+
+        # Transformer
+        x = self.transformer(x)                            # (B, H, 64)
+
+        # Mean‑pool over time
+        pooled = x.mean(dim=1)                             # (B, 64)
+
+        return self.fc(pooled)import torch
+import torch.nn as nn
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from config import OBSERVATION_HISTORY, NUM_LIDAR
+
+class SB3_LSTM_Extractor(BaseFeaturesExtractor):
+    """
+    Spatio‑temporal feature extractor:
+    - 1D CNN per LiDAR scan (spatial)
+    - LSTM over time (temporal)
+    - Concatenates other features at each timestep
+    """
+    def __init__(self, observation_space, features_dim=256):
+        super().__init__(observation_space, features_dim)
+
+        self.history = OBSERVATION_HISTORY
+        self.lidar_dim = NUM_LIDAR
+        self.other_dim = observation_space.shape[0] // self.history - self.lidar_dim
+
+        # Spatial encoder (same CNN as above)
+        self.cnn = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        cnn_out = 32 * self.lidar_dim
+
+        # LSTM over time
+        self.lstm = nn.LSTM(
+            input_size=cnn_out + self.other_dim,
+            hidden_size=128,
+            batch_first=True
+        )
+
+        self.fc = nn.Linear(128, features_dim)
+
+    def forward(self, observations):
+        batch = observations.shape[0]
+        seq = observations.view(batch, self.history, self.lidar_dim + self.other_dim)
+
+        lidar_seq = seq[:, :, :self.lidar_dim]
+        other_seq = seq[:, :, self.lidar_dim:]
+
+        # Encode each timestep spatially
+        bh = batch * self.history
+        lidar_flat = lidar_seq.reshape(bh, 1, self.lidar_dim)
+        cnn_out = self.cnn(lidar_flat)
+        cnn_out = cnn_out.reshape(batch, self.history, -1)
+
+        combined = torch.cat([cnn_out, other_seq], dim=2)
+
+        # LSTM
+        _, (h_n, _) = self.lstm(combined)           # h_n: (1, B, 128)
+        features = self.fc(h_n.squeeze(0))
+        return featuresimport torch
+import torch.nn as nn
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from config import OBSERVATION_HISTORY, NUM_LIDAR
+
+class SB3_CNNGRU_Extractor(BaseFeaturesExtractor):
+    """
+    Spatio‑temporal feature extractor:
+    - 1D CNN per LiDAR scan (spatial)
+    - GRU over time (temporal)
+    - Concatenates other features (velocities, waypoint) at each timestep
+    """
+    def __init__(self, observation_space, features_dim=256):
+        super().__init__(observation_space, features_dim)
+
+        self.history = OBSERVATION_HISTORY
+        # Per‑timestep observation: LiDAR (NUM_LIDAR) + vel (2) + waypoint (3)
+        self.lidar_dim = NUM_LIDAR
+        self.other_dim = observation_space.shape[0] // self.history - self.lidar_dim
+        # Should be 5 (2 velocities + 3 waypoint)
+
+        # Spatial encoder: 1D CNN for LiDAR rays (input channels=1, length=36)
+        self.cnn = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        cnn_out = 32 * self.lidar_dim   # e.g., 32 * 36 = 1152
+
+        # GRU over time: input size = CNN features + other features
+        self.gru = nn.GRU(
+            input_size=cnn_out + self.other_dim,
+            hidden_size=128,
+            batch_first=True
+        )
+
+        # Final projection to features_dim
+        self.fc = nn.Linear(128, features_dim)
+
+    def forward(self, observations):
+        """
+        observations: (batch, history * (lidar_dim + other_dim))
+        """
+        batch = observations.shape[0]
+        # Reshape to (batch, history, lidar_dim + other_dim)
+        seq = observations.view(batch, self.history, self.lidar_dim + self.other_dim)
+
+        # Split LiDAR and other features
+        lidar_seq = seq[:, :, :self.lidar_dim]          # (B, H, 36)
+        other_seq = seq[:, :, self.lidar_dim:]          # (B, H, other_dim)
+
+        # Process each timestep with CNN
+        # Flatten batch and time: (B*H, 1, 36)
+        bh = batch * self.history
+        lidar_flat = lidar_seq.reshape(bh, 1, self.lidar_dim)
+        cnn_out = self.cnn(lidar_flat)                  # (B*H, cnn_out)
+        cnn_out = cnn_out.reshape(batch, self.history, -1)  # (B, H, cnn_out)
+
+        # Concatenate with other features
+        combined = torch.cat([cnn_out, other_seq], dim=2)   # (B, H, cnn_out+other_dim)
+
+        # GRU over time
+        _, h_n = self.gru(combined)                     # h_n: (1, B, 128)
+        features = self.fc(h_n.squeeze(0))              # (B, features_dim)
+        return features
+
+ cat env/planners.py 
 import numpy as np
 import random
 
@@ -1136,7 +1471,10 @@ class RRTPlanner:
                 waypoint = self.path[i] + ratio * (self.path[i+1] - self.path[i])
                 return waypoint
             cum_dist += seg_len
-        return self.goalimport numpy as np
+        return self.goal
+
+cat env/controllers.py 
+import numpy as np
 import pybullet as p
 
 class DWAPlanner:
@@ -1219,213 +1557,13 @@ class DWAPlanner:
             yaw += w * self.dt
             t += self.dt
             min_clearance = min(min_clearance, np.min(lidar_ranges) * lidar_max_range)
-        return x, y, yaw, min_clearance(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ 
+        return x, y, yaw, min_clearance
 
-
-(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ cat policies/*extractor.py
-import torch
-import torch.nn as nn
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from config import OBSERVATION_HISTORY, NUM_LIDAR
-
-class SB3_CNNGRU_Extractor(BaseFeaturesExtractor):
-    """
-    Spatio‑temporal feature extractor:
-    - 1D CNN per LiDAR scan (spatial)
-    - GRU over time (temporal)
-    - Concatenates other features (velocities, waypoint) at each timestep
-    """
-    def __init__(self, observation_space, features_dim=256):
-        super().__init__(observation_space, features_dim)
-
-        self.history = OBSERVATION_HISTORY
-        # Per‑timestep observation: LiDAR (NUM_LIDAR) + vel (2) + waypoint (3)
-        self.lidar_dim = NUM_LIDAR
-        self.other_dim = observation_space.shape[0] // self.history - self.lidar_dim
-        # Should be 5 (2 velocities + 3 waypoint)
-
-        # Spatial encoder: 1D CNN for LiDAR rays (input channels=1, length=36)
-        self.cnn = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        cnn_out = 32 * self.lidar_dim   # e.g., 32 * 36 = 1152
-
-        # GRU over time: input size = CNN features + other features
-        self.gru = nn.GRU(
-            input_size=cnn_out + self.other_dim,
-            hidden_size=128,
-            batch_first=True
-        )
-
-        # Final projection to features_dim
-        self.fc = nn.Linear(128, features_dim)
-
-    def forward(self, observations):
-        """
-        observations: (batch, history * (lidar_dim + other_dim))
-        """
-        batch = observations.shape[0]
-        # Reshape to (batch, history, lidar_dim + other_dim)
-        seq = observations.view(batch, self.history, self.lidar_dim + self.other_dim)
-
-        # Split LiDAR and other features
-        lidar_seq = seq[:, :, :self.lidar_dim]          # (B, H, 36)
-        other_seq = seq[:, :, self.lidar_dim:]          # (B, H, other_dim)
-
-        # Process each timestep with CNN
-        # Flatten batch and time: (B*H, 1, 36)
-        bh = batch * self.history
-        lidar_flat = lidar_seq.reshape(bh, 1, self.lidar_dim)
-        cnn_out = self.cnn(lidar_flat)                  # (B*H, cnn_out)
-        cnn_out = cnn_out.reshape(batch, self.history, -1)  # (B, H, cnn_out)
-
-        # Concatenate with other features
-        combined = torch.cat([cnn_out, other_seq], dim=2)   # (B, H, cnn_out+other_dim)
-
-        # GRU over time
-        _, h_n = self.gru(combined)                     # h_n: (1, B, 128)
-        features = self.fc(h_n.squeeze(0))              # (B, features_dim)
-        return featuresimport torch
-import torch.nn as nn
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from config import OBSERVATION_HISTORY, NUM_LIDAR
-
-class SB3_LSTM_Extractor(BaseFeaturesExtractor):
-    """
-    Spatio‑temporal feature extractor:
-    - 1D CNN per LiDAR scan (spatial)
-    - LSTM over time (temporal)
-    - Concatenates other features at each timestep
-    """
-    def __init__(self, observation_space, features_dim=256):
-        super().__init__(observation_space, features_dim)
-
-        self.history = OBSERVATION_HISTORY
-        self.lidar_dim = NUM_LIDAR
-        self.other_dim = observation_space.shape[0] // self.history - self.lidar_dim
-
-        # Spatial encoder (same CNN as above)
-        self.cnn = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        cnn_out = 32 * self.lidar_dim
-
-        # LSTM over time
-        self.lstm = nn.LSTM(
-            input_size=cnn_out + self.other_dim,
-            hidden_size=128,
-            batch_first=True
-        )
-
-        self.fc = nn.Linear(128, features_dim)
-
-    def forward(self, observations):
-        batch = observations.shape[0]
-        seq = observations.view(batch, self.history, self.lidar_dim + self.other_dim)
-
-        lidar_seq = seq[:, :, :self.lidar_dim]
-        other_seq = seq[:, :, self.lidar_dim:]
-
-        # Encode each timestep spatially
-        bh = batch * self.history
-        lidar_flat = lidar_seq.reshape(bh, 1, self.lidar_dim)
-        cnn_out = self.cnn(lidar_flat)
-        cnn_out = cnn_out.reshape(batch, self.history, -1)
-
-        combined = torch.cat([cnn_out, other_seq], dim=2)
-
-        # LSTM
-        _, (h_n, _) = self.lstm(combined)           # h_n: (1, B, 128)
-        features = self.fc(h_n.squeeze(0))
-        return featuresimport torch
-import torch.nn as nn
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from config import OBSERVATION_HISTORY, NUM_LIDAR
-
-class SB3_Transformer_Extractor(BaseFeaturesExtractor):
-    """
-    Spatio‑temporal feature extractor:
-    - 1D CNN per LiDAR scan (spatial)
-    - Transformer over time (temporal)
-    - Concatenates other features at each timestep
-    """
-    def __init__(self, observation_space, features_dim=256, n_heads=4, n_layers=2):
-        super().__init__(observation_space, features_dim)
-
-        self.history = OBSERVATION_HISTORY
-        self.lidar_dim = NUM_LIDAR
-        self.other_dim = observation_space.shape[0] // self.history - self.lidar_dim
-
-        # Spatial encoder (CNN)
-        self.cnn = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-        cnn_out = 32 * self.lidar_dim
-
-        # Project combined features to transformer dimension (e.g., 64)
-        self.proj = nn.Linear(cnn_out + self.other_dim, 64)
-
-        # Positional encoding (learnable)
-        self.pos_encoding = nn.Parameter(torch.randn(1, self.history, 64))
-
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=64,
-            nhead=n_heads,
-            batch_first=True,
-            dropout=0.1
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-        # Final projection to features_dim
-        self.fc = nn.Linear(64, features_dim)
-
-    def forward(self, observations):
-        batch = observations.shape[0]
-        seq = observations.view(batch, self.history, self.lidar_dim + self.other_dim)
-
-        lidar_seq = seq[:, :, :self.lidar_dim]
-        other_seq = seq[:, :, self.lidar_dim:]
-
-        # CNN per timestep
-        bh = batch * self.history
-        lidar_flat = lidar_seq.reshape(bh, 1, self.lidar_dim)
-        cnn_out = self.cnn(lidar_flat)
-        cnn_out = cnn_out.reshape(batch, self.history, -1)
-
-        # Combine with other features
-        combined = torch.cat([cnn_out, other_seq], dim=2)   # (B, H, cnn_out+other_dim)
-
-        # Project to transformer dimension
-        x = self.proj(combined)                            # (B, H, 64)
-        x = x + self.pos_encoding
-
-        # Transformer
-        x = self.transformer(x)                            # (B, H, 64)
-
-        # Mean‑pool over time
-        pooled = x.mean(dim=1)                             # (B, 64)
-
-        return self.fc(pooled)(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ 
-
-  
-(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ cat config.py 
+cat config.py eval.py
 import numpy as np
 
 # Simulation
-GUI = True        # default, overridden by command line
+GUI = True       # default, overridden by command line
 TIME_STEP = 1./240.
 MAX_STEPS = 1000
 # Environment type (will be overridden by command line)
@@ -1462,316 +1600,168 @@ DYNAMIC_CONFIG = {
 
 # Global planner (RRT)
 PLANNER_TYPE = 'rrt'
-PLANNER_UPDATE_FREQ = 4      # steps between replans
+PLANNER_UPDATE_FREQ = 10      # steps between replans
 WAYPOINT_DISTANCE = 1.0       # meters ahead on the path
 
 # Temporal observation (for LSTM and Transformer)
 OBSERVATION_HISTORY = 8       # number of past LiDAR scans
 # LiDAR noise parameters (set to zero for perfect sensor, old behaviour)
 LIDAR_NOISE_STD = 0.0       # standard deviation of Gaussian noise (e.g., 0.02)
-LIDAR_DROPOUT_RATE = 0.0    # fraction of rays that return max range (e.g., 0.03)(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ 
+LIDAR_DROPOUT_RATE = 0.0    # fraction of rays that return max range (e.g., 0.03)#!/usr/bin/env python3
+# eval.py – Corrected: uses info['reached_goal'] to set success reliably
 
-(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ cat run_rrt_purepursuit.py run_rrt_dwa.py 
-#!/usr/bin/env python3
-"""
-Classical baseline: RRT global planner + Pure Pursuit local controller.
-"""
-
-import numpy as np
-import time
-import sys
-import csv
-import pybullet as p
-from env.tb3_env import TB3Env
-from env.planners import RRTPlanner
-from config import STATIC_OBSTACLES, LINEAR_VEL, ANGULAR_VEL, GOAL_THRESHOLD, COLLISION_DIST, MAX_STEPS
-
-class PurePursuitController:
-    def __init__(self, env, lookahead=0.5):
-        self.env = env
-        self.lookahead = lookahead
-
-    def compute_cmd(self, waypoint):
-        """Return normalized action [linear, angular] in [-1,1]."""
-        robot_pos = self.env.get_robot_position()
-        robot_xy = np.array(robot_pos[:2])
-        _, ori = p.getBasePositionAndOrientation(self.env.robot_id)
-        _, _, robot_yaw = p.getEulerFromQuaternion(ori)
-
-        dx = waypoint[0] - robot_xy[0]
-        dy = waypoint[1] - robot_xy[1]
-        angle_to_wp = np.arctan2(dy, dx)
-        angle_error = angle_to_wp - robot_yaw
-        angle_error = np.arctan2(np.sin(angle_error), np.cos(angle_error))
-
-        # Angular control
-        k_ang = 2.0
-        angular = np.clip(k_ang * angle_error, -ANGULAR_VEL, ANGULAR_VEL)
-
-        # Linear speed based on heading alignment
-        heading_factor = max(0.0, 1.0 - abs(angle_error) / np.pi)
-        linear = LINEAR_VEL * (0.2 + 0.8 * heading_factor)
-
-        # Normalize to action space [-1,1]
-        return np.array([linear / LINEAR_VEL, angular / ANGULAR_VEL])
-
-def run_rrt_purepursuit(env_type, num_episodes=50, gui=False, output_csv="rrt_purepursuit_results.csv"):
-    import config
-    config.ENV_TYPE = env_type
-    config.GUI = gui
-
-    env = TB3Env(env_type=env_type, gui=gui)
-    controller = PurePursuitController(env, lookahead=0.5)
-    rrt = RRTPlanner(static_obstacles=STATIC_OBSTACLES, bounds=env.world_bounds)
-
-    metrics = []
-
-    for ep in range(num_episodes):
-        obs = env.reset()
-        start = env.get_robot_pose()[:2]
-        goal = env.goal_pos[:2]
-        straight_line_dist = np.linalg.norm(goal - start)
-
-        rrt.set_start(start)
-        rrt.set_goal(goal)
-        path = rrt.plan()
-        if path is None or len(path) < 2:
-            print(f"Episode {ep}: RRT failed")
-            metrics.append({
-                'episode': ep, 'steps': MAX_STEPS, 'success': False, 'collision': False,
-                'time_to_goal': 0, 'path_length': 0, 'path_efficiency': 0,
-                'smoothness_jerk': 0, 'min_clearance': 0, 'stuck_events': 0
-            })
-            continue
-
-        # Visualize path
-        env.draw_path(path, color=[0,1,0])
-
-        wp_idx = 1
-        waypoint = np.array(path[wp_idx])
-        steps = 0
-        done = False
-        collision = False
-        success = False
-        path_length = 0.0
-        prev_pos = start.copy()
-        angular_velocities = []
-        min_distances = []
-        stuck_counter = 0
-        stuck_events = 0
-        start_time = time.time()
-
-        while not done and steps < MAX_STEPS:
-            robot_pose = env.get_robot_pose()
-            robot_xy = robot_pose[:2]
-
-            # Advance waypoint
-            if np.linalg.norm(robot_xy - waypoint) < 0.3 and wp_idx < len(path)-1:
-                wp_idx += 1
-                waypoint = np.array(path[wp_idx])
-
-            # Pure pursuit action
-            action = controller.compute_cmd(waypoint)
-            angular_velocities.append(action[1] * ANGULAR_VEL)
-
-            # Step
-            step_result = env.step(action)
-            if len(step_result) == 5:
-                obs, reward, terminated, truncated, info = step_result
-                done = terminated or truncated
-            else:
-                obs, reward, done, info = step_result
-
-            steps += 1
-            curr_pos = np.array(env.get_robot_pose()[:2])
-
-            # Path length
-            step_dist = np.linalg.norm(curr_pos - prev_pos)
-            path_length += step_dist
-            prev_pos = curr_pos
-
-            # Stuck
-            if step_dist < 0.01:
-                stuck_counter += 1
-            else:
-                stuck_counter = 0
-            if stuck_counter >= 50:
-                stuck_events += 1
-                stuck_counter = 0
-
-            # Clearance
-            lidar = env.get_lidar()
-            min_dist = np.min(lidar) * config.LIDAR_RANGE
-            min_distances.append(min_dist)
-
-            # Collision
-            if isinstance(info, dict) and info.get('collision', False):
-                collision = True
-                done = True
-            elif reward < -100:
-                collision = True
-                done = True
-
-            # Goal
-            dist_to_goal = np.linalg.norm(curr_pos - goal)
-            if dist_to_goal < GOAL_THRESHOLD:
-                success = True
-                done = True
-
-        # Metrics
-        time_to_goal = time.time() - start_time
-        jerk = np.mean(np.abs(np.diff(angular_velocities))) if len(angular_velocities) > 1 else 0.0
-        min_clearance = np.min(min_distances) if min_distances else 0.0
-        path_efficiency = straight_line_dist / path_length if path_length > 0 else 0.0
-
-        metrics.append({
-            'episode': ep,
-            'steps': steps,
-            'time_to_goal': time_to_goal,
-            'path_length': path_length,
-            'path_efficiency': path_efficiency,
-            'smoothness_jerk': jerk,
-            'min_clearance': min_clearance,
-            'collision': collision,
-            'stuck_events': stuck_events,
-            'success': success
-        })
-
-        print(f"Episode {ep}: success={success}, steps={steps}, collision={collision}")
-
-    # Save CSV
-    with open(output_csv, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
-        writer.writeheader()
-        writer.writerows(metrics)
-
-    # Summary
-    success_rate = np.mean([m['success'] for m in metrics]) * 100
-    collision_rate = np.mean([m['collision'] for m in metrics]) * 100
-    avg_steps = np.mean([m['steps'] for m in metrics])
-    avg_eff = np.mean([m['path_efficiency'] for m in metrics])
-    print("\n===== RRT+PurePursuit Summary =====")
-    print(f"Success rate: {success_rate:.1f}%")
-    print(f"Collision rate: {collision_rate:.1f}%")
-    print(f"Average steps: {avg_steps:.1f}")
-    print(f"Path efficiency: {avg_eff:.2f}")
-    print(f"Results saved to {output_csv}")
-
-if __name__ == "__main__":
-    env_type = sys.argv[1] if len(sys.argv) > 1 else "static"
-    num_ep = int(sys.argv[2]) if len(sys.argv) > 2 else 50
-    gui = sys.argv[3].lower() == 'true' if len(sys.argv) > 3 else False
-    output = sys.argv[4] if len(sys.argv) > 4 else f"rrt_purepursuit_{env_type}.csv"
-    run_rrt_purepursuit(env_type, num_episodes=num_ep, gui=gui, output_csv=output)#!/usr/bin/env python3
-"""
-Classical baseline: RRT global planner + DWA local controller.
-Runs multiple episodes, logs metrics to CSV.
-"""
-
-import numpy as np
-import time
-import sys
-import csv
+import argparse
 import os
+import csv
+import time
+import random
+import numpy as np
+import torch
+from pathlib import Path
+
+from stable_baselines3 import SAC, PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
 from env.tb3_env import TB3Env
-from env.controllers import DWAPlanner
-from env.planners import RRTPlanner
-from config import STATIC_OBSTACLES, ENV_TYPE, GUI, GOAL_THRESHOLD, COLLISION_DIST, MAX_STEPS
+from env.tb3_env_hybrid import TB3HybridEnv
+from env.observation_wrapper import TemporalObservationWrapper
 
-def run_rrt_dwa(env_type, num_episodes=50, gui=False, output_csv="rrt_dwa_results.csv"):
-    """
-    Run RRT + DWA baseline.
-    """
-    # Set config
+from config import GOAL_THRESHOLD, COLLISION_DIST, LIDAR_RANGE, ANGULAR_VEL
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+def make_base_env(hybrid: bool, env_type: str, gui: bool):
+    if hybrid:
+        return TB3HybridEnv(env_type=env_type, gui=gui)
+    else:
+        return TB3Env(env_type=env_type, gui=gui)
+
+def unwrap_original_env(env):
+    while hasattr(env, 'venv'):
+        env = env.venv
+    if isinstance(env, DummyVecEnv):
+        env = env.envs[0]
+    while hasattr(env, 'env'):
+        env = env.env
+    return env
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, required=True,
+                        help='Path to the trained model .zip file (or base name without .zip)')
+    parser.add_argument('--env_type', type=str, default='mixed',
+                        choices=['static', 'mixed', 'dense'])
+    parser.add_argument('--algorithm', type=str, required=True,
+                        choices=['sac', 'ppo', 'cnn-gru-sac', 'lstm-sac', 'tx-sac'])
+    parser.add_argument('--hybrid', action='store_true')
+    parser.add_argument('--num_episodes', type=int, default=50)
+    parser.add_argument('--gui', action='store_true')
+    parser.add_argument('--output', type=str, default='eval_results.csv')
+    parser.add_argument('--seed', type=int, default=42)
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
     import config
-    config.ENV_TYPE = env_type
-    config.GUI = gui
+    config.ENV_TYPE = args.env_type
+    config.GUI = args.gui
 
-    env = TB3Env(env_type=env_type, gui=gui)
-    rrt = RRTPlanner(static_obstacles=STATIC_OBSTACLES, bounds=env.world_bounds)
-    dwa = DWAPlanner(max_lin=0.22, max_ang=2.84, lin_acc=0.5, ang_acc=3.2, dt=0.1, horizon=1.0)
+    print(f"\n{'='*60}")
+    print(f"Evaluating {args.algorithm} on {args.env_type} environment")
+    print(f"Hybrid mode: {args.hybrid}")
+    print(f"Model path: {args.model_path}")
+    print(f"Episodes: {args.num_episodes}")
+    print(f"{'='*60}\n")
 
-    """
-    dwa = DWAPlanner(
-        max_lin=0.35,      # faster
-        max_ang=3.5,       # sharper turns
-        lin_acc=0.8,       # quicker acceleration
-        ang_acc=5.0,       # quicker rotation
-        dt=0.05,           # finer simulation
-        horizon=1.5,       # look ahead further
-        num_samples_v=7,
-        num_samples_w=15,
-        min_clearance=0.12 # less conservative
-    )
-    """
+    # Locate model file
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        model_path_zip = model_path.with_suffix('.zip')
+        if model_path_zip.exists():
+            model_path = model_path_zip
+        else:
+            raise FileNotFoundError(f"Model file not found: {model_path} or {model_path_zip}")
+    print(f"[Eval] Using model: {model_path}")
+
+    # Create environment
+    base_env = make_base_env(args.hybrid, args.env_type, args.gui)
+    if args.algorithm in ['cnn-gru-sac', 'lstm-sac', 'tx-sac']:
+        base_env = TemporalObservationWrapper(base_env)
+        print("[Eval] TemporalObservationWrapper applied (history=8)")
+
+    env = DummyVecEnv([lambda: base_env])
+
+    # Load VecNormalize stats
+    norm_path = model_path.parent / "vecnormalize.pkl"
+    if norm_path.exists():
+        try:
+            env = VecNormalize.load(str(norm_path), env)
+            env.training = False
+            env.norm_reward = False
+            print(f"[Eval] Loaded VecNormalize stats from {norm_path}")
+        except Exception as e:
+            print(f"[Eval] Warning: could not load VecNormalize ({e})")
+    else:
+        print("[Eval] No VecNormalize stats found. Running without normalisation.")
+
+    # Load model
+    if args.algorithm in ['sac', 'cnn-gru-sac', 'lstm-sac', 'tx-sac']:
+        model = SAC.load(str(model_path), env=env)
+    else:
+        model = PPO.load(str(model_path), env=env)
+    print("[Eval] Model loaded successfully.\n")
 
     metrics = []
 
-    for ep in range(num_episodes):
+    for ep in range(args.num_episodes):
         obs = env.reset()
-        start = env.get_robot_pose()[:2]
-        goal = env.goal_pos[:2]
-        straight_line_dist = np.linalg.norm(goal - start)
+        obs = np.asarray(obs, dtype=np.float32)
+        original_env = unwrap_original_env(env)
 
-        # Plan global path
-        rrt.set_start(start)
-        rrt.set_goal(goal)
-        path = rrt.plan()
-        if path is None or len(path) < 2:
-            print(f"Episode {ep}: RRT failed to find path")
-            # Log as failure
-            metrics.append({
-                'episode': ep, 'steps': MAX_STEPS, 'success': False, 'collision': False,
-                'time_to_goal': 0, 'path_length': 0, 'path_efficiency': 0,
-                'smoothness_jerk': 0, 'min_clearance': 0, 'stuck_events': 0
-            })
-            continue
+        start_pos = np.array(original_env.get_robot_pose()[:2])
+        goal_pos = np.array(original_env.goal_pos[:2])
+        straight_line_dist = np.linalg.norm(goal_pos - start_pos)
 
-        # Waypoint tracking
-        wp_idx = 0
-        waypoint = np.array(path[0])
-        steps = 0
         done = False
-        collision = False
-        success = False
+        steps = 0
         path_length = 0.0
-        prev_pos = start.copy()
+        prev_pos = start_pos.copy()
+        collision = False
+        dynamic_collision = False
+        success = False
         angular_velocities = []
         min_distances = []
         stuck_counter = 0
         stuck_events = 0
         start_time = time.time()
+        goal_reached_info = False   # track info flag
 
-        while not done and steps < MAX_STEPS:
-            robot_pose = env.get_robot_pose()
-            robot_xy = robot_pose[:2]
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            ang_vel = action[0][1] * ANGULAR_VEL
+            angular_velocities.append(ang_vel)
 
-            # Advance waypoint when close
-            if np.linalg.norm(robot_xy - waypoint) < 0.2 and wp_idx < len(path)-1:
-                wp_idx += 1
-                waypoint = np.array(path[wp_idx])
-
-            # DWA command
-            action = dwa.compute_cmd(env, waypoint)
-            angular_velocities.append(action[1] * config.ANGULAR_VEL)  # for jerk
-
-            # Step environment (handles both Gym and Gymnasium)
             step_result = env.step(action)
             if len(step_result) == 5:
                 obs, reward, terminated, truncated, info = step_result
+                obs = np.asarray(obs, dtype=np.float32)
                 done = terminated or truncated
             else:
                 obs, reward, done, info = step_result
+                obs = np.asarray(obs, dtype=np.float32)
 
             steps += 1
-            curr_pos = np.array(env.get_robot_pose()[:2])
-
-            # Path length
+            curr_pos = np.array(original_env.get_robot_pose()[:2])
             step_dist = np.linalg.norm(curr_pos - prev_pos)
             path_length += step_dist
             prev_pos = curr_pos
 
-            # Stuck detection
             if step_dist < 0.01:
                 stuck_counter += 1
             else:
@@ -1780,30 +1770,36 @@ def run_rrt_dwa(env_type, num_episodes=50, gui=False, output_csv="rrt_dwa_result
                 stuck_events += 1
                 stuck_counter = 0
 
-            # LiDAR clearance
-            lidar = env.get_lidar()
-            min_dist = np.min(lidar) * config.LIDAR_RANGE
+            raw_lidar = np.array(original_env.get_lidar(), dtype=np.float32)
+            raw_lidar = np.clip(raw_lidar, 0.0, 1.0)
+            min_dist = np.min(raw_lidar) * LIDAR_RANGE
             min_distances.append(min_dist)
 
-            # Collision detection (from info or reward)
             if isinstance(info, dict) and info.get('collision', False):
                 collision = True
-                done = True
-            elif reward < -100:  # heuristic
-                collision = True
-                done = True
+                try:
+                    dyn_dists = original_env.get_dynamic_obstacle_distances()
+                    if dyn_dists and min(dyn_dists) < COLLISION_DIST:
+                        dynamic_collision = True
+                except AttributeError:
+                    pass
 
-            # Goal check
-            dist_to_goal = np.linalg.norm(curr_pos - goal)
-            if dist_to_goal < GOAL_THRESHOLD:
-                success = True
-                done = True
+            # Capture goal reached flag from info
+            if isinstance(info, dict) and info.get('reached_goal', False):
+                goal_reached_info = True
 
-        # Episode finished
+        # Episode finished – compute metrics
         time_to_goal = time.time() - start_time
         jerk = np.mean(np.abs(np.diff(angular_velocities))) if len(angular_velocities) > 1 else 0.0
         min_clearance = np.min(min_distances) if min_distances else 0.0
         path_efficiency = straight_line_dist / path_length if path_length > 0 else 0.0
+
+        # Determine success: either by distance or by info flag
+        if not collision:
+            final_pos = np.array(original_env.get_robot_pose()[:2])
+            dist_to_goal = np.linalg.norm(final_pos - goal_pos)
+            if dist_to_goal < GOAL_THRESHOLD or goal_reached_info:
+                success = True
 
         metrics.append({
             'episode': ep,
@@ -1814,33 +1810,43 @@ def run_rrt_dwa(env_type, num_episodes=50, gui=False, output_csv="rrt_dwa_result
             'smoothness_jerk': jerk,
             'min_clearance': min_clearance,
             'collision': collision,
+            'dynamic_collision': dynamic_collision,
             'stuck_events': stuck_events,
             'success': success
         })
 
-        print(f"Episode {ep}: success={success}, steps={steps}, collision={collision}, time={time_to_goal:.2f}s")
+        print(f"Episode {ep:3d}: success={success}, steps={steps:3d}, "
+              f"time={time_to_goal:.2f}s, eff={path_efficiency:.2f}, "
+              f"jerk={jerk:.3f}, clearance={min_clearance:.2f}, "
+              f"collision={collision}, dyn_coll={dynamic_collision}")
 
-    # Save CSV
-    with open(output_csv, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
-        writer.writeheader()
-        writer.writerows(metrics)
+    if metrics:
+        with open(args.output, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
+            writer.writeheader()
+            writer.writerows(metrics)
 
-    # Summary
     success_rate = np.mean([m['success'] for m in metrics]) * 100
     collision_rate = np.mean([m['collision'] for m in metrics]) * 100
+    dynamic_collision_rate = np.mean([m['dynamic_collision'] for m in metrics]) * 100
     avg_steps = np.mean([m['steps'] for m in metrics])
     avg_eff = np.mean([m['path_efficiency'] for m in metrics])
-    print("\n===== RRT+DWA Summary =====")
-    print(f"Success rate: {success_rate:.1f}%")
-    print(f"Collision rate: {collision_rate:.1f}%")
-    print(f"Average steps: {avg_steps:.1f}")
-    print(f"Path efficiency: {avg_eff:.2f}")
-    print(f"Results saved to {output_csv}")
+    avg_clearance = np.mean([m['min_clearance'] for m in metrics])
+    avg_stuck = np.mean([m['stuck_events'] for m in metrics])
+
+    print("\n" + "="*60)
+    print("EVALUATION SUMMARY")
+    print("="*60)
+    print(f"Success rate:            {success_rate:.1f}%")
+    print(f"Collision rate:          {collision_rate:.1f}%")
+    print(f"  - Dynamic collision:   {dynamic_collision_rate:.1f}%")
+    print(f"Average steps:           {avg_steps:.1f}")
+    print(f"Path efficiency:         {avg_eff:.3f}")
+    print(f"Min clearance (avg):     {avg_clearance:.2f} m")
+    print(f"Stuck events (avg):      {avg_stuck:.2f}")
+    print(f"Results saved to:        {args.output}")
+    print("="*60 + "\n")
 
 if __name__ == "__main__":
-    env_type = sys.argv[1] if len(sys.argv) > 1 else "static"
-    num_ep = int(sys.argv[2]) if len(sys.argv) > 2 else 50
-    gui = sys.argv[3].lower() == 'true' if len(sys.argv) > 3 else False
-    output = sys.argv[4] if len(sys.argv) > 4 else f"rrt_dwa_{env_type}.csv"
-    run_rrt_dwa(env_type, num_episodes=num_ep, gui=gui, output_csv=output)(rl_training) rj@ps:~/tb3_drl_ws/src/tb3_drl_nav$ 
+    main()
+
