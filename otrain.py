@@ -1,25 +1,67 @@
-# train.py – Complete W&B integration with normalised reward and sweep support
+"""
+Training entry point for the thesis experiments.
+
+Committed architecture:
+    E2E:
+        LiDAR history -> temporal encoder -> SAC -> (v, w)
+
+    Hybrid:
+        Static map -> RRT -> adaptive path-distance lookahead -> waypoint
+        -> LiDAR history + robot state + waypoint
+        -> temporal encoder -> SAC -> (v, w)
+
+Temporal algorithms use the fixed 8-frame observation wrapper and the
+corresponding CNN + LSTM/GRU/Transformer feature extractor.
+
+This file preserves the thesis experiment workflow:
+    - W&B
+    - TensorBoard
+    - evaluation
+    - checkpointing
+    - seeding
+    - model saving
+    - E2E / Hybrid architectures
+    - SAC / PPO / temporal SAC variants
+
+Important:
+    num_envs controls how many environments run in parallel.
+    Callback frequencies are automatically adjusted so that evaluation
+    and checkpointing remain approximately consistent in terms of
+    actual environment transitions.
+"""
 
 import argparse
-import random
-import numpy as np
-import torch
 import os
-import sys
+import random
 import subprocess
+import sys
 from datetime import datetime
 
+import numpy as np
+import torch
 import wandb
 from wandb.integration.sb3 import WandbCallback
 
-from stable_baselines3 import SAC, PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecNormalize,
+)
 
+from config import OBSERVATION_HISTORY
+from env.observation_wrapper import TemporalObservationWrapper
 from env.tb3_env import TB3Env
 from env.tb3_env_hybrid import TB3HybridEnv
-from env.observation_wrapper import TemporalObservationWrapper
-from config import OBSERVATION_HISTORY
+
+
+TEMPORAL_ALGORITHMS = {
+    "lstm-sac",
+    "tx-sac",
+    "cnn-gru-sac",
+}
 
 
 # ============================================================
@@ -27,64 +69,201 @@ from config import OBSERVATION_HISTORY
 # ============================================================
 def parse_args():
     parser = argparse.ArgumentParser()
-    
+
+    # --------------------------------------------------------
     # Environment
-    parser.add_argument('--env_type', type=str, default='mixed',
-                        choices=['empty','static', 'mixed', 'dense'])
-    parser.add_argument('--hybrid', type=lambda x: x.lower() == 'true', default=False,
-                        help='Use hybrid environment (true/false)')
-    parser.add_argument('--gui', action='store_true')
-    
+    # --------------------------------------------------------
+    parser.add_argument(
+        "--env_type",
+        type=str,
+        default="mixed",
+        choices=["empty", "static", "mixed", "dense"],
+    )
+
+    parser.add_argument(
+        "--hybrid",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="Use RRT-guided hybrid environment (true/false)",
+    )
+
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Enable PyBullet GUI",
+    )
+
+    # --------------------------------------------------------
     # Algorithm
-    parser.add_argument('--algorithm', type=str, default='sac',
-                        choices=['sac', 'ppo', 'lstm-sac', 'tx-sac', 'cnn-gru-sac'])
-    
+    # --------------------------------------------------------
+    parser.add_argument(
+        "--algorithm",
+        type=str,
+        default="sac",
+        choices=[
+            "sac",
+            "ppo",
+            "lstm-sac",
+            "tx-sac",
+            "cnn-gru-sac",
+        ],
+    )
+
+    # --------------------------------------------------------
     # Training
-    parser.add_argument('--total_timesteps', type=int, default=500000)
-    parser.add_argument('--eval_freq', type=int, default=10000)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--num_envs', type=int, default=1)
-    parser.add_argument('--pretrained', type=str, default=None)
-    parser.add_argument('--gpu', type=lambda x: x.lower() == 'true', default=True,
-                        help='Use GPU (true/false)')
-    parser.add_argument('--exp_suffix', type=str, default='')
-    
-    # Reward parameters (fully tunable for sweeps)
-    parser.add_argument('--goal_reward', type=float, default=20.0,
-                        help='Reward for reaching the goal')
-    parser.add_argument('--collision_penalty', type=float, default=10.0,
-                        help='Penalty for collision')
-    parser.add_argument('--progress_weight', type=float, default=3.0,
-                        help='Weight for progress toward waypoint/goal')
-    parser.add_argument('--ttc_weight', type=float, default=1.0,
-                        help='Weight for Time‑to‑Collision penalty')
-    parser.add_argument('--safety_dist_weight', type=float, default=0.5,
-                        help='Weight for distance‑based safety penalty')
-    parser.add_argument('--angular_penalty', type=float, default=0.05,
-                        help='Penalty for angular velocity')
-    parser.add_argument('--angular_jerk_penalty', type=float, default=0.1,
-                        help='Penalty for angular jerk')
-    parser.add_argument('--step_penalty', type=float, default=0.02,
-                        help='Constant step penalty')
-    parser.add_argument('--idle_penalty', type=float, default=0.05,
-                        help='Penalty for low linear velocity')
-    
-    # Hyperparameter override
-    parser.add_argument('--learning_rate', type=float, default=None,
-                        help='Override learning rate (default depends on algorithm)')
-    parser.add_argument('--batch_size', type=int, default=None,
-                        help='Override batch size (default 256 for SAC/Tx-SAC)')
-    
+    # --------------------------------------------------------
+    parser.add_argument(
+        "--total_timesteps",
+        type=int,
+        default=500000,
+    )
+
+    parser.add_argument(
+        "--eval_freq",
+        type=int,
+        default=10000,
+        help=(
+            "Evaluation interval measured in approximate environment "
+            "transitions. Automatically adjusted for num_envs."
+        ),
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel training environments. "
+            "Use 1 initially; increase only after benchmarking."
+        ),
+    )
+
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--gpu",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Use GPU if CUDA is available (true/false)",
+    )
+
+    parser.add_argument(
+        "--exp_suffix",
+        type=str,
+        default="",
+    )
+
+    # --------------------------------------------------------
+    # Off-policy training control
+    # --------------------------------------------------------
+    parser.add_argument(
+        "--gradient_steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of SAC gradient updates after each rollout step. "
+            "Use -1 to perform one gradient update per collected "
+            "environment transition."
+        ),
+    )
+
+    # --------------------------------------------------------
+    # Reward parameters
+    # --------------------------------------------------------
+    parser.add_argument(
+        "--goal_reward",
+        type=float,
+        default=10.0,
+        help="Reward for reaching the goal",
+    )
+
+    parser.add_argument(
+        "--collision_penalty",
+        type=float,
+        default=10.0,
+        help="Penalty for physical collision",
+    )
+
+    parser.add_argument(
+        "--progress_weight",
+        type=float,
+        default=2.0,
+        help="Weight for progress toward local waypoint/goal",
+    )
+
+    parser.add_argument(
+        "--clearance_weight",
+        type=float,
+        default=1.0,
+        help="Weight for near-obstacle clearance penalty",
+    )
+
+    parser.add_argument(
+        "--step_penalty",
+        type=float,
+        default=0.01,
+        help="Constant per-step penalty",
+    )
+
+    # --------------------------------------------------------
+    # Hyperparameter overrides
+    # --------------------------------------------------------
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=None,
+        help="Override learning rate",
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Override batch size",
+    )
+
+    # --------------------------------------------------------
     # W&B
-    parser.add_argument('--wandb_project', type=str, default='tb3-nav-research',
-                        help='W&B project name')
-    parser.add_argument('--wandb_run_name', type=str, default=None,
-                        help='W&B run name (auto-generated if not provided)')
-    parser.add_argument('--wandb_mode', type=str, default='online',
-                        choices=['online', 'offline', 'disabled'])
-    parser.add_argument('--wandb_tags', type=str, nargs='+', default=[],
-                        help='Tags for W&B run')
-    
+    # --------------------------------------------------------
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="tb3-nav-research",
+        help="W&B project name",
+    )
+
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="W&B run name",
+    )
+
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+    )
+
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Tags for W&B run",
+    )
+
     return parser.parse_args()
 
 
@@ -92,96 +271,265 @@ def parse_args():
 # SEEDING
 # ============================================================
 def set_seed(seed):
+    """Set the main Python/NumPy/PyTorch random seeds."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+        # Reproducibility is useful for thesis experiments.
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
 
 # ============================================================
-# BASE ENV FACTORY
+# BASE ENVIRONMENT FACTORY
 # ============================================================
 def make_base_env(hybrid: bool, env_type: str, gui: bool):
+    """
+    Create the committed E2E or hybrid environment.
+
+    GUI is controlled through Gymnasium's render_mode rather than
+    the global config.GUI value so training can safely run headless.
+    """
+    render_mode = "human" if gui else None
+
     if hybrid:
-        return TB3HybridEnv(env_type=env_type, gui=gui)
-    else:
-        return TB3Env(env_type=env_type, gui=gui)
+        return TB3HybridEnv(
+            env_type=env_type,
+            render_mode=render_mode,
+        )
+
+    return TB3Env(
+        env_type=env_type,
+        render_mode=render_mode,
+    )
 
 
 # ============================================================
-# VEC ENV FACTORY FOR SUBPROC
+# ENVIRONMENT WRAPPING
 # ============================================================
-def make_env_fn(hybrid, seed, rank, algorithm, env_type, gui):
+def wrap_env(env, algorithm):
+    """
+    Apply temporal observation history only to temporal experiments.
+
+    SAC and PPO use the normal 41-dimensional observation unless
+    a temporal algorithm explicitly requests the 8-frame history.
+    """
+    if algorithm in TEMPORAL_ALGORITHMS:
+        env = TemporalObservationWrapper(
+            env,
+            history_len=OBSERVATION_HISTORY,
+        )
+
+    return env
+
+
+# ============================================================
+# REWARD CONFIGURATION
+# ============================================================
+def configure_reward(env, args):
+    """
+    Apply the experiment's reward parameters.
+
+    The current reward contains:
+        progress
+        clearance penalty
+        step penalty
+        success reward
+        collision penalty
+
+    This function is intentionally simple and does not recreate
+    the previous TTC/angular/jerk/idle reward.
+    """
+    reward_calc = getattr(
+        env.unwrapped if hasattr(env, "unwrapped") else env,
+        "reward_calc",
+        None,
+    )
+
+    if reward_calc is None:
+        return
+
+    attribute_map = {
+        "progress_weight": args.progress_weight,
+        "clearance_weight": args.clearance_weight,
+        "step_penalty": args.step_penalty,
+        "success_reward": args.goal_reward,
+        "collision_penalty": args.collision_penalty,
+    }
+
+    for name, value in attribute_map.items():
+        if hasattr(reward_calc, name):
+            setattr(reward_calc, name, float(value))
+
+
+# ============================================================
+# TRAINING ENVIRONMENT FACTORY
+# ============================================================
+def make_env_fn(
+    hybrid,
+    seed,
+    rank,
+    algorithm,
+    env_type,
+    gui,
+    args,
+):
+    """
+    Factory used by SubprocVecEnv.
+
+    IMPORTANT:
+        This function runs inside each subprocess.
+
+    Therefore reward configuration must happen here, not only
+    in the parent process.
+    """
+
     def _init():
         env_seed = seed + rank
+
+        # Seed Python and NumPy inside this worker.
         random.seed(env_seed)
         np.random.seed(env_seed)
-        env = make_base_env(hybrid=hybrid, env_type=env_type, gui=gui)
-        env.reset(seed=env_seed)
-        if algorithm in ['lstm-sac', 'tx-sac', 'cnn-gru-sac']:
-            env = TemporalObservationWrapper(env)
+
+        env = make_base_env(
+            hybrid=hybrid,
+            env_type=env_type,
+            gui=gui,
+        )
+
+        env = wrap_env(
+            env,
+            algorithm,
+        )
+
+        # IMPORTANT:
+        # Configure the reward inside the worker process.
+        configure_reward(
+            env,
+            args,
+        )
+
+        # Reset after wrapping so the temporal wrapper can correctly
+        # initialize its history.
+        env.reset(
+            seed=env_seed,
+        )
+
+        # Monitor must be inside the vectorized environment so SB3 can
+        # correctly record episode reward and episode length.
+        env = Monitor(env)
+
         return env
+
     return _init
 
 
 # ============================================================
-# POLICY KWARGS FOR TEMPORAL MODELS
+# POLICY KWARGS
 # ============================================================
-def get_policy_kwargs(algorithm, feature_dim=256):
-    policy_kwargs = None
-    if algorithm == 'cnn-gru-sac':
-        try:
-            from policies.cnn_gru_extractor import SB3_CNNGRU_Extractor
-            policy_kwargs = dict(
-                features_extractor_class=SB3_CNNGRU_Extractor,
-                features_extractor_kwargs=dict(features_dim=feature_dim),
-                net_arch=dict(pi=[feature_dim], qf=[feature_dim])
-            )
-            print(f"[Policy] Using CNN-GRU extractor with features_dim={feature_dim}")
-        except ImportError:
-            print("WARNING: CNN-GRU extractor not found. Falling back to MLP.")
-            return None
-    elif algorithm == 'lstm-sac':
-        try:
-            from policies.lstm_extractor import SB3_LSTM_Extractor
-            policy_kwargs = dict(
-                features_extractor_class=SB3_LSTM_Extractor,
-                features_extractor_kwargs=dict(features_dim=feature_dim),
-                net_arch=dict(pi=[feature_dim], qf=[feature_dim])
-            )
-            print(f"[Policy] Using LSTM extractor with features_dim={feature_dim}")
-        except ImportError:
-            print("WARNING: LSTM extractor not found. Falling back to MLP.")
-            return None
-    elif algorithm == 'tx-sac':
-        try:
-            from policies.transformer_extractor import SB3_Transformer_Extractor
-            policy_kwargs = dict(
-                features_extractor_class=SB3_Transformer_Extractor,
-                features_extractor_kwargs=dict(features_dim=feature_dim),
-                net_arch=dict(pi=[feature_dim], qf=[feature_dim])
-            )
-            print(f"[Policy] Using Transformer extractor with features_dim={feature_dim}")
-        except ImportError:
-            print("WARNING: Transformer extractor not found. Falling back to MLP.")
-            return None
-    return policy_kwargs
+def get_policy_kwargs(
+    algorithm,
+    feature_dim=256,
+):
+    """
+    Return the requested temporal feature extractor.
+
+    There is intentionally no silent fallback to ordinary MLP SAC.
+    """
+    if algorithm == "lstm-sac":
+        from policies.lstm_extractor import LSTMFeatureExtractor
+
+        print(
+            f"[Policy] Using LSTM extractor "
+            f"with features_dim={feature_dim}"
+        )
+
+        return {
+            "features_extractor_class": LSTMFeatureExtractor,
+            "features_extractor_kwargs": {
+                "history_len": OBSERVATION_HISTORY,
+                "lidar_dim": 36,
+                "non_lidar_dim": 5,
+                "features_dim": feature_dim,
+            },
+            "net_arch": {
+                "pi": [feature_dim],
+                "qf": [feature_dim],
+            },
+        }
+
+    if algorithm == "tx-sac":
+        from policies.transformer_extractor import (
+            TransformerFeatureExtractor,
+        )
+
+        print(
+            f"[Policy] Using Transformer extractor "
+            f"with features_dim={feature_dim}"
+        )
+
+        return {
+            "features_extractor_class": TransformerFeatureExtractor,
+            "features_extractor_kwargs": {
+                "history_len": OBSERVATION_HISTORY,
+                "lidar_dim": 36,
+                "non_lidar_dim": 5,
+                "features_dim": feature_dim,
+            },
+            "net_arch": {
+                "pi": [feature_dim],
+                "qf": [feature_dim],
+            },
+        }
+
+    if algorithm == "cnn-gru-sac":
+        from policies.cnn_gru_extractor import GRUFeatureExtractor
+
+        print(
+            f"[Policy] Using GRU extractor "
+            f"with features_dim={feature_dim}"
+        )
+
+        return {
+            "features_extractor_class": GRUFeatureExtractor,
+            "features_extractor_kwargs": {
+                "history_len": OBSERVATION_HISTORY,
+                "lidar_dim": 36,
+                "non_lidar_dim": 5,
+                "features_dim": feature_dim,
+            },
+            "net_arch": {
+                "pi": [feature_dim],
+                "qf": [feature_dim],
+            },
+        }
+
+    return None
 
 
 # ============================================================
-# GET GIT HASH
+# GIT HASH
 # ============================================================
 def get_git_hash():
+    """Return a short git commit hash for experiment tracking."""
     try:
-        result = subprocess.run(['git', 'rev-parse', 'HEAD'],
-                                capture_output=True, text=True, cwd=os.path.dirname(__file__))
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(__file__),
+        )
+
         if result.returncode == 0:
             return result.stdout.strip()[:8]
-    except:
+
+    except Exception:
         pass
+
     return "unknown"
 
 
@@ -190,83 +538,168 @@ def get_git_hash():
 # ============================================================
 def main():
     args = parse_args()
-    
-    device = torch.device('cuda' if args.gpu and torch.cuda.is_available() else 'cpu')
+
+    # --------------------------------------------------------
+    # Basic validation
+    # --------------------------------------------------------
+    if args.num_envs < 1:
+        raise ValueError(
+            "--num_envs must be >= 1"
+        )
+
+    if args.gradient_steps == 0:
+        raise ValueError(
+            "--gradient_steps cannot be 0. "
+            "Use a positive integer or -1."
+        )
+
+    if args.eval_freq < 1:
+        raise ValueError(
+            "--eval_freq must be >= 1"
+        )
+
+    # --------------------------------------------------------
+    # Device
+    # --------------------------------------------------------
+    device = torch.device(
+        "cuda"
+        if args.gpu and torch.cuda.is_available()
+        else "cpu"
+    )
+
     print(f"[Device] Using: {device}")
+
+    if args.gpu and not torch.cuda.is_available():
+        print(
+            "[Device] GPU requested, but CUDA is unavailable. "
+            "Training will run on CPU."
+        )
+
     set_seed(args.seed)
-    
+
     import config
+
     config.ENV_TYPE = args.env_type
     config.GUI = args.gui
-    
-    # Push all reward parameters to environment variables for reward.py
-    os.environ['GOAL_REWARD'] = str(args.goal_reward)
-    os.environ['COLLISION_PENALTY'] = str(args.collision_penalty)
-    os.environ['PROGRESS_WEIGHT'] = str(args.progress_weight)
-    os.environ['TTC_WEIGHT'] = str(args.ttc_weight)
-    os.environ['SAFETY_DIST_WEIGHT'] = str(args.safety_dist_weight)
-    os.environ['ANGULAR_PENALTY'] = str(args.angular_penalty)
-    os.environ['ANGULAR_JERK_PENALTY'] = str(args.angular_jerk_penalty)
-    os.environ['STEP_PENALTY'] = str(args.step_penalty)
-    os.environ['IDLE_PENALTY'] = str(args.idle_penalty)
-    
-    print(f"[Reward] goal={args.goal_reward}, collision={args.collision_penalty}, "
-          f"progress={args.progress_weight}, ttc={args.ttc_weight}, "
-          f"safety_dist={args.safety_dist_weight}, angular={args.angular_penalty}, "
-          f"step={args.step_penalty}, idle={args.idle_penalty}")
-    
-    # ----------------------------------------------------------
-    # W&B INIT
-    # ----------------------------------------------------------
-    run_name = args.wandb_run_name or f"{args.env_type}_{args.algorithm}_{'hybrid' if args.hybrid else 'e2e'}_seed{args.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    git_hash = get_git_hash()
-    
-    # Default hyperparameters per algorithm
-    if args.algorithm == 'sac':
+
+    # --------------------------------------------------------
+    # Architecture summary
+    # --------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("[Architecture]")
+
+    if args.hybrid:
+        print(
+            "RRT -> adaptive path-distance lookahead -> "
+            "local waypoint -> temporal/E2E SAC controller"
+        )
+        print(
+            "RRT plans static obstacles; "
+            "LiDAR handles dynamic obstacles."
+        )
+    else:
+        print(
+            "LiDAR/history -> policy -> SAC/PPO controller"
+        )
+
+    print("=" * 60)
+
+    print("\n[Training configuration]")
+    print(f"  Algorithm:       {args.algorithm}")
+    print(f"  Environment:     {args.env_type}")
+    print(f"  Hybrid:          {args.hybrid}")
+    print(f"  Num envs:        {args.num_envs}")
+    print(f"  Timesteps:       {args.total_timesteps:,}")
+    print(f"  Seed:             {args.seed}")
+    print(f"  Gradient steps:  {args.gradient_steps}")
+
+    if args.num_envs > 1:
+        print(
+            "\n[Parallel training note]"
+            "\n  Each vectorized step collects "
+            f"{args.num_envs} transitions."
+        )
+
+    print("=" * 60 + "\n")
+
+    # --------------------------------------------------------
+    # Algorithm hyperparameters
+    # --------------------------------------------------------
+    if args.algorithm == "sac":
         learning_rate = 3e-4
         buffer_size = 300000
         ent_coef = "auto_0.5"
-    elif args.algorithm == 'ppo':
+
+    elif args.algorithm == "ppo":
         learning_rate = 3e-4
         buffer_size = None
         ent_coef = 0.01
-    else:  # temporal models
+
+    else:
         learning_rate = 5e-5
         buffer_size = 800000
         ent_coef = 0.1
-    
+
     batch_size = 256
+
     if args.learning_rate is not None:
         learning_rate = args.learning_rate
+
     if args.batch_size is not None:
         batch_size = args.batch_size
-    
+
+    # --------------------------------------------------------
+    # W&B
+    # --------------------------------------------------------
+    run_name = (
+        args.wandb_run_name
+        or f"{args.env_type}_{args.algorithm}_"
+        f"{'hybrid' if args.hybrid else 'e2e'}_"
+        f"seed{args.seed}_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+
+    git_hash = get_git_hash()
+
     wandb_run = wandb.init(
         project=args.wandb_project,
         mode=args.wandb_mode,
         tags=args.wandb_tags,
         config={
-            # Environment & algorithm
+            # Environment / algorithm
             "env_type": args.env_type,
             "algorithm": args.algorithm,
             "hybrid": args.hybrid,
+            "architecture": (
+                "RRT-adaptive-waypoint-temporal-SAC"
+                if args.hybrid
+                else "LiDAR-history-policy-SAC"
+            ),
             "total_timesteps": args.total_timesteps,
             "eval_freq": args.eval_freq,
             "seed": args.seed,
             "num_envs": args.num_envs,
+            "gradient_steps": args.gradient_steps,
             "pretrained": args.pretrained is not None,
             "use_gpu": args.gpu,
             "exp_suffix": args.exp_suffix,
-            # Reward parameters
+
+            # Observation
+            "observation_history": OBSERVATION_HISTORY,
+            "base_observation_dim": 41,
+            "temporal_observation_dim": (
+                41 * OBSERVATION_HISTORY
+                if args.algorithm in TEMPORAL_ALGORITHMS
+                else 41
+            ),
+
+            # Reward
             "goal_reward": args.goal_reward,
             "collision_penalty": args.collision_penalty,
             "progress_weight": args.progress_weight,
-            "ttc_weight": args.ttc_weight,
-            "safety_dist_weight": args.safety_dist_weight,
-            "angular_penalty": args.angular_penalty,
-            "angular_jerk_penalty": args.angular_jerk_penalty,
+            "clearance_weight": args.clearance_weight,
             "step_penalty": args.step_penalty,
-            "idle_penalty": args.idle_penalty,
+
             # Hyperparameters
             "learning_rate": learning_rate,
             "batch_size": batch_size,
@@ -274,6 +707,7 @@ def main():
             "gamma": 0.99,
             "tau": 0.005,
             "ent_coef": ent_coef,
+
             # System
             "device": str(device),
             "git_commit": git_hash,
@@ -283,165 +717,447 @@ def main():
         name=run_name,
         sync_tensorboard=True,
         monitor_gym=True,
-        save_code=True
+        save_code=True,
     )
-    
-    print(f"\n{'='*60}")
+
+    print("\n" + "=" * 60)
     print(f"W&B Run: {wandb_run.name}")
     print(f"W&B URL: {wandb_run.get_url()}")
-    print(f"{'='*60}\n")
-    
-    # ----------------------------------------------------------
-    # ENVIRONMENT CREATION
-    # ----------------------------------------------------------
+    print("=" * 60 + "\n")
+
+    # --------------------------------------------------------
+    # TRAINING ENVIRONMENT
+    # --------------------------------------------------------
     print("[Env] Creating training environments...")
+
     if args.num_envs > 1:
-        env_fns = [make_env_fn(args.hybrid, args.seed, i, args.algorithm, args.env_type, args.gui)
-                   for i in range(args.num_envs)]
-        env = SubprocVecEnv(env_fns)
-        print(f"[Env] Created {args.num_envs} parallel environments (SubprocVecEnv)")
+
+        env_fns = [
+            make_env_fn(
+                hybrid=args.hybrid,
+                seed=args.seed,
+                rank=i,
+                algorithm=args.algorithm,
+                env_type=args.env_type,
+                gui=args.gui,
+                args=args,
+            )
+            for i in range(args.num_envs)
+        ]
+
+        env = SubprocVecEnv(
+            env_fns
+        )
+
+        print(
+            f"[Env] Created {args.num_envs} parallel "
+            "environments using SubprocVecEnv."
+        )
+
     else:
+
         def _single_env():
-            base = make_base_env(args.hybrid, args.env_type, args.gui)
-            base.reset(seed=args.seed)
-            if args.algorithm in ['lstm-sac', 'tx-sac', 'cnn-gru-sac']:
-                base = TemporalObservationWrapper(base)
+            base = make_base_env(
+                hybrid=args.hybrid,
+                env_type=args.env_type,
+                gui=args.gui,
+            )
+
+            base = wrap_env(
+                base,
+                args.algorithm,
+            )
+
+            configure_reward(
+                base,
+                args,
+            )
+
+            base = Monitor(
+                base
+            )
+
             return base
-        env = DummyVecEnv([_single_env])
-        print("[Env] Created single environment (DummyVecEnv)")
-    
-    env = VecNormalize(env, norm_obs=True, norm_reward=True)
-    print("[Env] VecNormalize added (norm_obs=True, norm_reward=True)")
-    
-    # ----------------------------------------------------------
+
+        env = DummyVecEnv(
+            [_single_env]
+        )
+
+        print(
+            "[Env] Created single environment "
+            "using DummyVecEnv."
+        )
+
+    # --------------------------------------------------------
+    # VecNormalize
+    # --------------------------------------------------------
+    env = VecNormalize(
+        env,
+        norm_obs=True,
+        norm_reward=True,
+    )
+
+    print(
+        "[Env] VecNormalize added "
+        "(norm_obs=True, norm_reward=True)"
+    )
+
+    # --------------------------------------------------------
     # EVALUATION ENVIRONMENT
-    # ----------------------------------------------------------
+    # --------------------------------------------------------
     print("[Env] Creating evaluation environment...")
+
     def _eval_env():
-        base = make_base_env(args.hybrid, args.env_type, args.gui)
-        if args.algorithm in ['lstm-sac', 'tx-sac', 'cnn-gru-sac']:
-            base = TemporalObservationWrapper(base)
+        base = make_base_env(
+            hybrid=args.hybrid,
+            env_type=args.env_type,
+            gui=args.gui,
+        )
+
+        base = wrap_env(
+            base,
+            args.algorithm,
+        )
+
+        configure_reward(
+            base,
+            args,
+        )
+
+        # IMPORTANT:
+        # Monitor is applied before VecNormalize so evaluation can
+        # recover true episode rewards and episode lengths.
+        base = Monitor(
+            base
+        )
+
         return base
-    eval_env = DummyVecEnv([_eval_env])
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False)
-    eval_env.norm_reward = False
+
+    eval_env = DummyVecEnv(
+        [_eval_env]
+    )
+
+    eval_env = VecNormalize(
+        eval_env,
+        norm_obs=True,
+        norm_reward=False,
+    )
+
+    # Evaluation uses training observation statistics.
     eval_env.obs_rms = env.obs_rms
+
+    # Do not update normalization statistics during evaluation.
     eval_env.training = False
-    
-    # ----------------------------------------------------------
-    # MODEL NAME & POLICY KWARGS
-    # ----------------------------------------------------------
-    mode = "hybrid" if args.hybrid else "end2end"
-    model_name = f'{args.env_type}_{args.algorithm}_{mode}_seed{args.seed}_{args.exp_suffix}'
-    print(f"[Model] Name: {model_name}")
-    
+
+    # We want the original reward scale during evaluation.
+    eval_env.norm_reward = False
+
+    print(
+        "[Eval] Using training observation normalization statistics."
+    )
+    print(
+        "[Eval] Reward normalization disabled."
+    )
+
+    # --------------------------------------------------------
+    # Callback frequency
+    # --------------------------------------------------------
+    #
+    # SB3 callback counters count vectorized env.step() calls.
+    #
+    # Example:
+    #     num_envs = 4
+    #     eval_freq = 10000
+    #
+    # Without adjustment:
+    #     10000 callback calls
+    #     ≈ 40000 environment transitions
+    #
+    # We therefore divide by num_envs.
+    #
+    callback_eval_freq = max(
+        args.eval_freq // args.num_envs,
+        1,
+    )
+
+    print(
+        f"[Eval] Requested evaluation interval: "
+        f"{args.eval_freq:,} environment transitions"
+    )
+
+    print(
+        f"[Eval] Actual callback frequency: "
+        f"{callback_eval_freq:,} vectorized steps"
+    )
+
+    # --------------------------------------------------------
+    # MODEL NAME
+    # --------------------------------------------------------
+    mode = (
+        "hybrid"
+        if args.hybrid
+        else "end2end"
+    )
+
+    model_name = (
+        f"{args.env_type}_{args.algorithm}_{mode}_"
+        f"seed{args.seed}_{args.exp_suffix}"
+    )
+
+    print(
+        f"[Model] Name: {model_name}"
+    )
+
+    # --------------------------------------------------------
+    # POLICY KWARGS
+    # --------------------------------------------------------
     policy_kwargs = None
-    if args.algorithm in ['lstm-sac', 'tx-sac', 'cnn-gru-sac']:
-        policy_kwargs = get_policy_kwargs(args.algorithm)
-        if policy_kwargs is None:
-            print("[Policy] Falling back to SAC with MLP policy")
-            args.algorithm = 'sac'
-    
-    # ----------------------------------------------------------
+
+    if args.algorithm in TEMPORAL_ALGORITHMS:
+        policy_kwargs = get_policy_kwargs(
+            args.algorithm
+        )
+
+    # --------------------------------------------------------
     # MODEL CREATION
-    # ----------------------------------------------------------
-    print(f"[Model] Creating {args.algorithm} model...")
-    if args.algorithm == 'sac':
-        model = SAC("MlpPolicy", env,
-                    learning_rate=learning_rate,
-                    buffer_size=300000,
-                    batch_size=batch_size,
-                    tau=0.005,
-                    gamma=0.99,
-                    ent_coef="auto_0.5",
-                    verbose=1,
-                    tensorboard_log=f"./tb_logs/{model_name}",
-                    device=device)
-    elif args.algorithm == 'ppo':
-        model = PPO("MlpPolicy", env,
-                    learning_rate=learning_rate,
-                    n_steps=2048,
-                    batch_size=batch_size if batch_size else 128,
-                    n_epochs=10,
-                    gamma=0.995,
-                    gae_lambda=0.95,
-                    clip_range=0.2,
-                    vf_coef=0.5,
-                    ent_coef=0.01,
-                    policy_kwargs=dict(net_arch=[256,256]),
-                    verbose=1,
-                    tensorboard_log=f"./tb_logs/{model_name}",
-                    device=device)
-    else:  # temporal models
-        model = SAC("MlpPolicy", env,
-                    learning_rate=learning_rate,
-                    buffer_size=buffer_size,
-                    batch_size=batch_size,
-                    tau=0.005,
-                    gamma=0.99,
-                    ent_coef=ent_coef,
-                    policy_kwargs=policy_kwargs,
-                    verbose=1,
-                    tensorboard_log=f"./tb_logs/{model_name}",
-                    device=device)
-    
-    if args.pretrained and os.path.isfile(args.pretrained):
-        model.set_parameters(args.pretrained)
-        wandb_run.config.update({"pretrained_model": args.pretrained}, allow_val_change=True)
-        print(f"[Model] Loaded pretrained weights from {args.pretrained}")
-    
-    # ----------------------------------------------------------
+    # --------------------------------------------------------
+    print(
+        f"[Model] Creating {args.algorithm} model..."
+    )
+
+    if args.algorithm == "sac":
+
+        model = SAC(
+            "MlpPolicy",
+            env,
+            learning_rate=learning_rate,
+            buffer_size=buffer_size,
+            batch_size=batch_size,
+            tau=0.005,
+            gamma=0.99,
+            ent_coef=ent_coef,
+            train_freq=1,
+            gradient_steps=args.gradient_steps,
+            verbose=1,
+            tensorboard_log=f"./tb_logs/{model_name}",
+            device=device,
+            seed=args.seed,
+        )
+
+    elif args.algorithm == "ppo":
+
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=learning_rate,
+            n_steps=2048,
+            batch_size=batch_size,
+            n_epochs=10,
+            gamma=0.995,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            vf_coef=0.5,
+            ent_coef=0.01,
+            policy_kwargs=dict(
+                net_arch=[256, 256]
+            ),
+            verbose=1,
+            tensorboard_log=f"./tb_logs/{model_name}",
+            device=device,
+            seed=args.seed,
+        )
+
+    else:
+
+        model = SAC(
+            "MlpPolicy",
+            env,
+            learning_rate=learning_rate,
+            buffer_size=buffer_size,
+            batch_size=batch_size,
+            tau=0.005,
+            gamma=0.99,
+            ent_coef=ent_coef,
+            train_freq=1,
+            gradient_steps=args.gradient_steps,
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            tensorboard_log=f"./tb_logs/{model_name}",
+            device=device,
+            seed=args.seed,
+        )
+
+    # --------------------------------------------------------
+    # PRETRAINED PARAMETERS
+    # --------------------------------------------------------
+    if args.pretrained:
+
+        if not os.path.isfile(
+            args.pretrained
+        ):
+            raise FileNotFoundError(
+                f"Pretrained model not found: "
+                f"{args.pretrained}"
+            )
+
+        model.set_parameters(
+            args.pretrained
+        )
+
+        wandb_run.config.update(
+            {
+                "pretrained_model": args.pretrained
+            },
+            allow_val_change=True,
+        )
+
+        print(
+            "[Model] Loaded pretrained neural-network "
+            "parameters from:"
+        )
+        print(
+            f"        {args.pretrained}"
+        )
+
+    # --------------------------------------------------------
     # CALLBACKS
-    # ----------------------------------------------------------
+    # --------------------------------------------------------
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=f"./models/{model_name}",
         log_path=f"./logs/{model_name}",
-        eval_freq=args.eval_freq,
+        eval_freq=callback_eval_freq,
         deterministic=True,
-        verbose=1
+        verbose=1,
     )
+
     wandb_callback = WandbCallback(
         verbose=2,
         model_save_path=f"./models/{model_name}",
-        model_save_freq=args.eval_freq,
-        gradient_save_freq=1000
+        model_save_freq=callback_eval_freq,
+        gradient_save_freq=1000,
     )
-    
-    # ----------------------------------------------------------
+
+    # --------------------------------------------------------
     # TRAINING
-    # ----------------------------------------------------------
-    print(f"\n{'='*60}")
-    print(f"Starting training: {model_name}")
-    print(f"Total timesteps: {args.total_timesteps:,}")
-    print(f"Evaluation frequency: {args.eval_freq:,} steps")
-    print(f"{'='*60}\n")
-    
+    # --------------------------------------------------------
+    print("\n" + "=" * 60)
+    print(
+        f"Starting training: {model_name}"
+    )
+    print(
+        f"Total timesteps: {args.total_timesteps:,}"
+    )
+    print(
+        f"Evaluation every approximately "
+        f"{args.eval_freq:,} environment transitions"
+    )
+    print(
+        f"Parallel environments: {args.num_envs}"
+    )
+    print(
+        f"Gradient steps per rollout: "
+        f"{args.gradient_steps}"
+    )
+    print("=" * 60 + "\n")
+
     model.learn(
         total_timesteps=args.total_timesteps,
-        callback=[eval_callback, wandb_callback]
+        callback=[
+            eval_callback,
+            wandb_callback,
+        ],
     )
-    
-    print(f"\n✅ Training finished. Best model saved in ./models/{model_name}")
-    
-    # ----------------------------------------------------------
+
+    print(
+        f"\nTraining finished. "
+        f"Best model saved in "
+        f"./models/{model_name}"
+    )
+
+    # --------------------------------------------------------
     # SAVE FINAL MODEL
-    # ----------------------------------------------------------
-    model_dir = f"./models/{model_name}_final"
-    os.makedirs(model_dir, exist_ok=True)
-    model.save(os.path.join(model_dir, "model.zip"))
-    env.save(os.path.join(model_dir, "vecnormalize.pkl"))
-    print(f"[Model] Final model saved to {model_dir}")
-    
-    model_artifact = wandb.Artifact('trained_model', type='model')
-    model_artifact.add_file(os.path.join(model_dir, "model.zip"))
-    wandb_run.log_artifact(model_artifact)
-    print("[W&B] Model artifact uploaded")
-    
-    wandb_run.summary["final_model_path"] = model_dir
-    wandb_run.summary["total_timesteps"] = args.total_timesteps
+    # --------------------------------------------------------
+    model_dir = (
+        f"./models/{model_name}_final"
+    )
+
+    os.makedirs(
+        model_dir,
+        exist_ok=True,
+    )
+
+    model.save(
+        os.path.join(
+            model_dir,
+            "model.zip",
+        )
+    )
+
+    env.save(
+        os.path.join(
+            model_dir,
+            "vecnormalize.pkl",
+        )
+    )
+
+    print(
+        f"[Model] Final model saved to "
+        f"{model_dir}"
+    )
+
+    # --------------------------------------------------------
+    # W&B ARTIFACT
+    # --------------------------------------------------------
+    model_artifact = wandb.Artifact(
+        "trained_model",
+        type="model",
+    )
+
+    model_artifact.add_file(
+        os.path.join(
+            model_dir,
+            "model.zip",
+        )
+    )
+
+    model_artifact.add_file(
+        os.path.join(
+            model_dir,
+            "vecnormalize.pkl",
+        )
+    )
+
+    wandb_run.log_artifact(
+        model_artifact
+    )
+
+    print(
+        "[W&B] Model and VecNormalize "
+        "artifacts uploaded."
+    )
+
+    wandb_run.summary[
+        "final_model_path"
+    ] = model_dir
+
+    wandb_run.summary[
+        "total_timesteps"
+    ] = args.total_timesteps
+
+    # --------------------------------------------------------
+    # CLEANUP
+    # --------------------------------------------------------
+    eval_env.close()
+    env.close()
+
     wandb_run.finish()
-    print(f"\n✅ W&B run finished. View results at: {wandb_run.get_url()}")
+
+    print(
+        "\nW&B run finished. "
+        f"View results at: "
+        f"{wandb_run.get_url()}"
+    )
 
 
 if __name__ == "__main__":

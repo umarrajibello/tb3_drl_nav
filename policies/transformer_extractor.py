@@ -1,36 +1,74 @@
 """
 Transformer feature extractor for temporal LiDAR navigation.
 
-Expected input:
-    batch x (history_len * obs_dim)
-
-With the committed environment:
+Committed observation:
     history_len = 8
     obs_dim = 41
     LiDAR = 36
     non-LiDAR = 5
 
-Per timestep:
-    36 LiDAR values -> shared 1D CNN -> spatial feature
-    + 5 robot/waypoint features
-    -> timestep embedding
+Architecture per timestep:
+    36-beam circular LiDAR
+        -> circular Conv1D 1 -> 16
+        -> circular Conv1D 16 -> cnn_channels
+        -> angular pooling 36 -> 12
+        -> flatten
+        -> Linear(12 * cnn_channels -> 64)
+        -> 64-D LiDAR feature
 
-Across timesteps:
-    positional encoding
-    -> TransformerEncoder
-    -> temporal mean pooling
-    -> MLP
-    -> SAC feature vector
+    64-D LiDAR feature + 5-D robot/waypoint state
+        -> 69-D timestep input
+        -> temporal positional encoding
+        -> TransformerEncoder
+        -> temporal mean pooling
+        -> 256-D SAC feature vector
+
+The LiDAR encoder is intentionally circular because the first and last
+LiDAR beams represent neighboring angular directions. Angular pooling
+reduces the 36-beam scan to 12 coarse sectors (three adjacent beams per
+sector) while retaining explicit angular position information.
+
+This is a fixed-window temporal feature extractor. The complete 8-frame
+history is supplied in every policy forward pass.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
+class CircularConv1d(nn.Module):
+    """1-D convolution with circular padding at both angular boundaries."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+    ):
+        super().__init__()
+
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd for symmetric circular padding.")
+
+        self.padding = kernel_size // 2
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=0,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Circular padding makes beam 0 and beam (N-1) neighbors.
+        x = F.pad(x, (self.padding, self.padding), mode="circular")
+        return self.conv(x)
+
+
 class TransformerFeatureExtractor(BaseFeaturesExtractor):
-    """CNN + Transformer temporal feature extractor for SAC."""
+    """Circular-LiDAR CNN + Transformer temporal feature extractor for SAC."""
 
     def __init__(
         self,
@@ -38,7 +76,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         history_len: int = 8,
         lidar_dim: int = 36,
         non_lidar_dim: int = 5,
-        cnn_channels: int = 32,
+        cnn_channels: int = 16,
         d_model: int = 64,
         nhead: int = 4,
         num_layers: int = 2,
@@ -50,6 +88,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         self.history_len = int(history_len)
         self.lidar_dim = int(lidar_dim)
         self.non_lidar_dim = int(non_lidar_dim)
+        self.cnn_channels = int(cnn_channels)
         self.obs_dim = self.lidar_dim + self.non_lidar_dim
 
         if self.history_len < 1:
@@ -78,39 +117,67 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
                 f"got {observation_space.shape[0]}."
             )
 
+        if self.lidar_dim % 3 != 0:
+            raise ValueError(
+                "lidar_dim must be divisible by 3 for 3-beam angular pooling."
+            )
+
+        if self.cnn_channels < 1:
+            raise ValueError("cnn_channels must be >= 1")
+
         if d_model % nhead != 0:
             raise ValueError(
                 f"d_model ({d_model}) must be divisible by nhead ({nhead})."
             )
 
-        # Shared spatial encoder applied independently to every LiDAR frame.
-        # The LiDAR is an ordered angular scan, so Conv1d can capture local
-        # relationships between neighboring rays.
+        # ------------------------------------------------------------------
+        # Spatial LiDAR encoder
+        # ------------------------------------------------------------------
+        # The LiDAR scan is circular in angle. Circular padding prevents an
+        # artificial boundary between the last and first beam.
+        #
+        # 36 beams
+        #   -> circular Conv1D: 1 -> 16
+        #   -> circular Conv1D: 16 -> cnn_channels
+        #   -> 3-beam angular pooling: 36 -> 12
+        #   -> flatten: cnn_channels * 12
+        #   -> Linear: cnn_channels * 12 -> 64
         self.lidar_cnn = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, padding=1),
+            CircularConv1d(1, 16, kernel_size=3),
             nn.ReLU(),
-            nn.Conv1d(16, cnn_channels, kernel_size=3, padding=1),
+            CircularConv1d(16, self.cnn_channels, kernel_size=3),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
+            nn.AvgPool1d(kernel_size=3, stride=3),
             nn.Flatten(),
         )
 
-        cnn_out_dim = cnn_channels
+        self.angular_sector_count = self.lidar_dim // 3
+        cnn_flat_dim = self.cnn_channels * self.angular_sector_count
 
-        # Combine spatial LiDAR representation with the robot/waypoint state
-        # belonging to the same timestep.
-        self.input_projection = nn.Sequential(
-            nn.Linear(cnn_out_dim + self.non_lidar_dim, d_model),
+        self.lidar_projection = nn.Sequential(
+            nn.Linear(cnn_flat_dim, 64),
             nn.ReLU(),
         )
 
-        # Learnable temporal positional encoding. Shape is:
-        # 1 x history_len x d_model
+        # ------------------------------------------------------------------
+        # Timestep fusion
+        # ------------------------------------------------------------------
+        # 64-D LiDAR feature + 5-D robot/waypoint state -> 64-D embedding.
+        self.input_projection = nn.Sequential(
+            nn.Linear(64 + self.non_lidar_dim, d_model),
+            nn.ReLU(),
+        )
+
+        # Learnable temporal positional encoding:
+        # [1, history_len, d_model]
         self.positional_encoding = nn.Parameter(
             torch.zeros(1, self.history_len, d_model)
         )
         nn.init.normal_(self.positional_encoding, mean=0.0, std=0.02)
 
+        # ------------------------------------------------------------------
+        # Temporal encoder
+        # ------------------------------------------------------------------
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -126,6 +193,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
             num_layers=num_layers,
         )
 
+        # Final SAC feature vector.
         self.output_projection = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, features_dim),
@@ -148,7 +216,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         lidar = x[:, :, :self.lidar_dim]
         non_lidar = x[:, :, self.lidar_dim:]
 
-        # Process every LiDAR frame with the same CNN.
+        # Process every LiDAR frame with the same spatial encoder.
         # [B, 8, 36] -> [B*8, 1, 36]
         lidar = lidar.reshape(
             batch_size * self.history_len,
@@ -156,17 +224,22 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
             self.lidar_dim,
         )
 
+        # [B*8, 1, 36]
+        #   -> [B*8, cnn_channels, 12]
+        #   -> [B*8, cnn_channels*12]
         lidar_features = self.lidar_cnn(lidar)
 
-        # [B*8, cnn_channels] -> [B, 8, cnn_channels]
+        # Project the angularly structured LiDAR representation to 64-D.
+        lidar_features = self.lidar_projection(lidar_features)
+
+        # [B*8, 64] -> [B, 8, 64]
         lidar_features = lidar_features.reshape(
             batch_size,
             self.history_len,
-            -1,
+            64,
         )
 
-        # Same timestep's LiDAR and robot/waypoint state are fused before
-        # temporal attention.
+        # Fuse LiDAR and robot/waypoint state from the same timestep.
         timestep_features = torch.cat(
             [lidar_features, non_lidar],
             dim=-1,

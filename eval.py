@@ -37,6 +37,7 @@ from config import (
     GOAL_THRESHOLD,
     LIDAR_RANGE,
     TIME_STEP,
+    LINEAR_VEL,
 )
 from env.observation_wrapper import TemporalObservationWrapper
 from env.tb3_env import TB3Env
@@ -44,7 +45,7 @@ from env.tb3_env_hybrid import TB3HybridEnv
 
 
 TEMPORAL_ALGORITHMS = {
-    "cnn-gru-sac",
+    "gru-sac",
     "lstm-sac",
     "tx-sac",
 }
@@ -113,7 +114,7 @@ def parse_args():
         choices=[
             "sac",
             "ppo",
-            "cnn-gru-sac",
+            "gru-sac",
             "lstm-sac",
             "tx-sac",
         ],
@@ -162,19 +163,48 @@ def parse_args():
 
 
 def resolve_model_path(model_path):
+    """
+    Resolve a Stable-Baselines3 model path.
+
+    Accepted inputs:
+      1. Direct .zip model path
+      2. Directory containing model.zip
+      3. Directory containing exactly one .zip model
+    """
     path = Path(model_path)
 
-    if path.exists():
+    # Case 1: explicitly supplied .zip file
+    if path.is_file():
         return path
 
-    if path.suffix != ".zip":
-        zip_path = path.with_suffix(".zip")
-        if zip_path.exists():
-            return zip_path
+    # Case 2: supplied model directory
+    if path.is_dir():
+        model_zip = path / "model.zip"
 
+        if model_zip.is_file():
+            return model_zip
+
+        # Fallback: look for exactly one .zip file
+        zip_files = sorted(path.glob("*.zip"))
+
+        if len(zip_files) == 1:
+            return zip_files[0]
+
+        if len(zip_files) > 1:
+            raise FileNotFoundError(
+                f"Multiple .zip model files found in directory: {path}\n"
+                f"Please specify the exact model .zip file."
+            )
+
+        raise FileNotFoundError(
+            f"No model .zip file found in directory: {path}"
+        )
+
+    # Case 3: path does not exist
     raise FileNotFoundError(
-        f"Model file not found: {path}"
+        f"Model path does not exist: {path}"
     )
+
 
 
 def find_vecnormalize_path(model_path, explicit_path=None):
@@ -299,7 +329,7 @@ def main():
 
     if args.algorithm in {
         "sac",
-        "cnn-gru-sac",
+        "gru-sac",
         "lstm-sac",
         "tx-sac",
     }:
@@ -366,9 +396,15 @@ def main():
 
         collision = False
         dynamic_collision = False
+        out_of_bounds = False
         success = False
 
-        angular_velocities = []
+        commanded_linear_velocities = []
+        commanded_angular_velocities = []
+
+        realized_linear_velocities = []
+        realized_angular_velocities = []
+
         min_distances = []
 
         stuck_counter = 0
@@ -384,6 +420,15 @@ def main():
                 deterministic=True,
             )
 
+            normalized_action = np.asarray(action).reshape(-1)
+
+            if ep == 0 and steps < 20:
+                print(
+                    f"[Action diagnostic] step={steps:3d}, "
+                    f"a_v={normalized_action[0]: .4f}, "
+                    f"a_w={normalized_action[1]: .4f}"
+                )
+
             action = np.asarray(
                 action,
                 dtype=np.float32,
@@ -395,16 +440,43 @@ def main():
                     -1,
                 )
 
+
+
+            linear_vel = float(
+                action[0][0] * LINEAR_VEL
+            )
+
             ang_vel = float(
                 action[0][1] * ANGULAR_VEL
             )
 
-            angular_velocities.append(
+            # Record the command BEFORE stepping the simulator.
+            # Realized velocity is sampled AFTER env.step() so it corresponds
+            # to the motion produced during this control interval.
+            commanded_linear_velocities.append(
+                linear_vel
+            )
+
+            commanded_angular_velocities.append(
                 ang_vel
             )
 
             obs, reward, dones, infos = env.step(
                 action
+            )
+
+            # Measure physical robot velocity AFTER the action has been
+            # applied for the complete control interval.
+            real_linear_vel, real_angular_vel = (
+                original_env.get_robot_velocity()
+            )
+
+            realized_linear_velocities.append(
+                float(real_linear_vel)
+            )
+
+            realized_angular_velocities.append(
+                float(real_angular_vel)
             )
 
             obs = np.asarray(
@@ -492,6 +564,12 @@ def main():
                         pass
 
                 if info.get(
+                    "out_of_bounds",
+                    False,
+                ):
+                    out_of_bounds = True
+
+                if info.get(
                     "reached_goal",
                     False,
                 ):
@@ -524,6 +602,8 @@ def main():
             termination_reason = "success"
         elif collision:
             termination_reason = "collision"
+        elif out_of_bounds:
+            termination_reason = "out_of_bounds"
         else:
             termination_reason = "timeout"
 
@@ -536,13 +616,14 @@ def main():
         else:
             time_to_goal_s = float("nan")
 
-        if len(angular_velocities) > 1:
+        if len(commanded_angular_velocities) > 1:
             angular_jerk = float(
                 np.mean(
                     np.abs(
                         np.diff(
-                            angular_velocities
-                        )
+                            commanded_angular_velocities
+                        )   
+                        
                     )
                 )
             )
@@ -556,13 +637,59 @@ def main():
         else:
             min_clearance = float("nan")
 
-        if path_length > 1e-8:
+
+        mean_commanded_linear_velocity = float(
+            np.mean(commanded_linear_velocities)
+        ) if commanded_linear_velocities else float("nan")
+
+        mean_abs_commanded_angular_velocity = float(
+            np.mean(
+                np.abs(commanded_angular_velocities)
+            )
+        ) if commanded_angular_velocities else float("nan")
+
+        mean_realized_linear_velocity = float(
+            np.mean(realized_linear_velocities)
+        ) if realized_linear_velocities else float("nan")
+
+        mean_abs_realized_angular_velocity = float(
+            np.mean(
+                np.abs(realized_angular_velocities)
+            )
+        ) if realized_angular_velocities else float("nan")
+
+        low_motion_fraction = float(
+            np.mean(
+                np.asarray(
+                    realized_linear_velocities
+                ) < 0.01
+            )
+        ) if realized_linear_velocities else float("nan")
+
+        net_displacement = float(
+            np.linalg.norm(
+                final_pos - start_pos
+            )
+        )
+
+        motion_efficiency = (
+            net_displacement / path_length
+            if path_length > 1e-8
+            else float("nan")
+        )
+
+
+
+        
+
+        if success and path_length > 1e-8:
             path_efficiency = (
-                straight_line_dist
-                / path_length
+            straight_line_dist
+            / path_length
             )
         else:
-            path_efficiency = 0.0
+            path_efficiency = float("nan")
+
 
         metrics.append(
             {
@@ -571,6 +698,7 @@ def main():
                 "termination_reason": termination_reason,
                 "collision": collision,
                 "dynamic_collision": dynamic_collision,
+                "out_of_bounds": out_of_bounds,
                 "steps": steps,
                 "episode_reward": episode_reward,
                 "simulation_duration_s": simulation_duration,
@@ -582,6 +710,20 @@ def main():
                 "smoothness_jerk": angular_jerk,
                 "min_clearance": min_clearance,
                 "stuck_events": stuck_events,
+                "mean_commanded_linear_velocity":
+                    mean_commanded_linear_velocity,
+                "mean_abs_commanded_angular_velocity":
+                    mean_abs_commanded_angular_velocity,
+                "mean_realized_linear_velocity":
+                    mean_realized_linear_velocity,
+                "mean_abs_realized_angular_velocity":
+                    mean_abs_realized_angular_velocity,
+                "low_motion_fraction":
+                    low_motion_fraction,
+                "net_displacement":
+                    net_displacement,
+                "motion_efficiency":
+                    motion_efficiency,
             }
         )
 
@@ -644,6 +786,16 @@ def main():
         * 100.0
     )
 
+    out_of_bounds_rate = (
+        np.mean(
+            [
+                m["termination_reason"] == "out_of_bounds"
+                for m in metrics
+            ]
+        )
+        * 100.0
+    )
+
     dynamic_collision_rate = (
         np.mean(
             [
@@ -666,9 +818,19 @@ def main():
         [m["path_length"] for m in metrics]
     )
 
-    avg_efficiency = np.mean(
-        [m["path_efficiency"] for m in metrics]
+    efficiency_values = [
+        m["path_efficiency"]
+        for m in metrics
+        if np.isfinite(m["path_efficiency"])
+    ]
+
+    avg_efficiency = (
+        float(np.mean(efficiency_values))
+        if efficiency_values
+        else float("nan")
     )
+
+    
 
     avg_final_distance = np.mean(
         [
@@ -718,6 +880,11 @@ def main():
     print(
         f"Timeout rate:                 "
         f"{timeout_rate:.1f}%"
+    )
+
+    print(
+        f"Out-of-bounds rate:            "
+        f"{out_of_bounds_rate:.1f}%"
     )
 
     print(

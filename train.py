@@ -31,6 +31,7 @@ Important:
 """
 
 import argparse
+import json
 import os
 import random
 import subprocess
@@ -60,7 +61,7 @@ from env.tb3_env_hybrid import TB3HybridEnv
 TEMPORAL_ALGORITHMS = {
     "lstm-sac",
     "tx-sac",
-    "cnn-gru-sac",
+    "gru-sac",
 }
 
 
@@ -88,6 +89,21 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--lookahead_mode",
+        type=str,
+        default="velocity_clearance",
+        choices=[
+            "fixed",
+            "velocity",
+            "velocity_clearance",
+        ],
+        help=(
+            "Hybrid lookahead strategy. "
+            "Default is velocity_clearance."
+        ),
+    )
+
+    parser.add_argument(
         "--gui",
         action="store_true",
         help="Enable PyBullet GUI",
@@ -105,7 +121,7 @@ def parse_args():
             "ppo",
             "lstm-sac",
             "tx-sac",
-            "cnn-gru-sac",
+            "gru-sac",
         ],
     )
 
@@ -287,7 +303,7 @@ def set_seed(seed):
 # ============================================================
 # BASE ENVIRONMENT FACTORY
 # ============================================================
-def make_base_env(hybrid: bool, env_type: str, gui: bool):
+def make_base_env(hybrid: bool, env_type: str, gui: bool, lookahead_mode: str = "velocity_clearance",):
     """
     Create the committed E2E or hybrid environment.
 
@@ -300,6 +316,7 @@ def make_base_env(hybrid: bool, env_type: str, gui: bool):
         return TB3HybridEnv(
             env_type=env_type,
             render_mode=render_mode,
+            lookahead_mode=lookahead_mode,
         )
 
     return TB3Env(
@@ -399,6 +416,7 @@ def make_env_fn(
             hybrid=hybrid,
             env_type=env_type,
             gui=gui,
+            lookahead_mode=args.lookahead_mode,
         )
 
         env = wrap_env(
@@ -486,8 +504,8 @@ def get_policy_kwargs(
             },
         }
 
-    if algorithm == "cnn-gru-sac":
-        from policies.cnn_gru_extractor import GRUFeatureExtractor
+    if algorithm == "gru-sac":
+        from policies.gru_extractor import GRUFeatureExtractor
 
         print(
             f"[Policy] Using GRU extractor "
@@ -531,6 +549,116 @@ def get_git_hash():
         pass
 
     return "unknown"
+
+
+
+# ============================================================
+# LOCAL EXPERIMENT METADATA
+# ============================================================
+def build_experiment_metadata(
+    args,
+    device,
+    learning_rate,
+    batch_size,
+    buffer_size,
+    ent_coef,
+    callback_eval_freq,
+    git_hash,
+):
+    """Build a self-contained local record of the training run."""
+    import config
+
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "git_commit": git_hash,
+
+        "environment": {
+            "env_type": args.env_type,
+            "hybrid": args.hybrid,
+            "lookahead_mode": (
+                    args.lookahead_mode
+                    if args.hybrid
+                    else None
+                ),
+            "gui": args.gui,
+            "num_envs": args.num_envs,
+            "max_steps": config.MAX_STEPS,
+            "goal_threshold": config.GOAL_THRESHOLD,
+            "collision_distance": config.COLLISION_DIST,
+            "lidar_rays": config.NUM_LIDAR,
+            "lidar_range": config.LIDAR_RANGE,
+            "observation_history": OBSERVATION_HISTORY,
+            "planner_update_freq": config.PLANNER_UPDATE_FREQ,
+            "waypoint_distance": config.WAYPOINT_DISTANCE,
+        },
+
+        "training": {
+            "algorithm": args.algorithm,
+            "total_timesteps": args.total_timesteps,
+            "eval_freq_transitions": args.eval_freq,
+            "callback_eval_freq": callback_eval_freq,
+            "seed": args.seed,
+            "gradient_steps": args.gradient_steps,
+            "pretrained": args.pretrained,
+            "learning_rate": learning_rate,
+            "batch_size": batch_size,
+            "buffer_size": buffer_size,
+            "gamma": 0.99,
+            "tau": 0.005,
+            "ent_coef": ent_coef,
+        },
+
+        "reward": {
+            "goal_reward": args.goal_reward,
+            "collision_penalty": args.collision_penalty,
+            "progress_weight": args.progress_weight,
+            "clearance_weight": args.clearance_weight,
+            "step_penalty": args.step_penalty,
+        },
+
+        "observation": {
+            "base_dim": 41,
+            "history_length": OBSERVATION_HISTORY,
+            "temporal_dim": (
+                41 * OBSERVATION_HISTORY
+                if args.algorithm in TEMPORAL_ALGORITHMS
+                else 41
+            ),
+        },
+
+        "system": {
+            "device": str(device),
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_device_count": (
+                int(torch.cuda.device_count())
+                if torch.cuda.is_available()
+                else 0
+            ),
+            "cuda_device_name": (
+                torch.cuda.get_device_name(0)
+                if torch.cuda.is_available()
+                else None
+            ),
+            "python_version": sys.version.split()[0],
+            "torch_version": torch.__version__,
+            "numpy_version": np.__version__,
+        },
+
+        "tracking": {
+            "wandb_project": args.wandb_project,
+            "wandb_mode": args.wandb_mode,
+            "wandb_tags": args.wandb_tags,
+            "exp_suffix": args.exp_suffix,
+        },
+    }
+
+
+def save_experiment_metadata(path, metadata):
+    """Save experiment metadata locally as JSON."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+
 
 
 # ============================================================
@@ -608,6 +736,10 @@ def main():
     print(f"  Algorithm:       {args.algorithm}")
     print(f"  Environment:     {args.env_type}")
     print(f"  Hybrid:          {args.hybrid}")
+    if args.hybrid:
+        print(
+            f"  Lookahead mode:  {args.lookahead_mode}"
+        )
     print(f"  Num envs:        {args.num_envs}")
     print(f"  Timesteps:       {args.total_timesteps:,}")
     print(f"  Seed:             {args.seed}")
@@ -625,7 +757,14 @@ def main():
     # --------------------------------------------------------
     # Algorithm hyperparameters
     # --------------------------------------------------------
-    if args.algorithm == "sac":
+    # --------------------------------------------------------
+
+    if args.algorithm in {
+        "sac",
+        "lstm-sac",
+        "tx-sac",
+        "gru-sac",
+    }:
         learning_rate = 3e-4
         buffer_size = 300000
         ent_coef = "auto_0.5"
@@ -635,12 +774,8 @@ def main():
         buffer_size = None
         ent_coef = 0.01
 
-    else:
-        learning_rate = 5e-5
-        buffer_size = 800000
-        ent_coef = 0.1
-
     batch_size = 256
+    
 
     if args.learning_rate is not None:
         learning_rate = args.learning_rate
@@ -661,69 +796,43 @@ def main():
 
     git_hash = get_git_hash()
 
-    wandb_run = wandb.init(
-        project=args.wandb_project,
-        mode=args.wandb_mode,
-        tags=args.wandb_tags,
-        config={
-            # Environment / algorithm
-            "env_type": args.env_type,
-            "algorithm": args.algorithm,
-            "hybrid": args.hybrid,
-            "architecture": (
-                "RRT-adaptive-waypoint-temporal-SAC"
-                if args.hybrid
-                else "LiDAR-history-policy-SAC"
-            ),
-            "total_timesteps": args.total_timesteps,
-            "eval_freq": args.eval_freq,
-            "seed": args.seed,
-            "num_envs": args.num_envs,
-            "gradient_steps": args.gradient_steps,
-            "pretrained": args.pretrained is not None,
-            "use_gpu": args.gpu,
-            "exp_suffix": args.exp_suffix,
-
-            # Observation
-            "observation_history": OBSERVATION_HISTORY,
-            "base_observation_dim": 41,
-            "temporal_observation_dim": (
-                41 * OBSERVATION_HISTORY
-                if args.algorithm in TEMPORAL_ALGORITHMS
-                else 41
-            ),
-
-            # Reward
-            "goal_reward": args.goal_reward,
-            "collision_penalty": args.collision_penalty,
-            "progress_weight": args.progress_weight,
-            "clearance_weight": args.clearance_weight,
-            "step_penalty": args.step_penalty,
-
-            # Hyperparameters
-            "learning_rate": learning_rate,
-            "batch_size": batch_size,
-            "buffer_size": buffer_size,
-            "gamma": 0.99,
-            "tau": 0.005,
-            "ent_coef": ent_coef,
-
-            # System
-            "device": str(device),
-            "git_commit": git_hash,
-            "python_version": sys.version[:50],
-            "torch_version": torch.__version__,
-        },
-        name=run_name,
-        sync_tensorboard=True,
-        monitor_gym=True,
-        save_code=True,
+    metadata = build_experiment_metadata(
+        args=args,
+        device=device,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        buffer_size=buffer_size,
+        ent_coef=ent_coef,
+        callback_eval_freq=max(
+            args.eval_freq // args.num_envs,
+            1,
+        ),
+        git_hash=git_hash,
     )
 
-    print("\n" + "=" * 60)
-    print(f"W&B Run: {wandb_run.name}")
-    print(f"W&B URL: {wandb_run.get_url()}")
-    print("=" * 60 + "\n")
+    wandb_run = None
+
+    if args.wandb_mode != "disabled":
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            mode=args.wandb_mode,
+            tags=args.wandb_tags,
+            config=metadata,
+            name=run_name,
+            sync_tensorboard=True,
+            monitor_gym=True,
+            save_code=True,
+        )
+
+        print("\n" + "=" * 60)
+        print(f"W&B Run: {wandb_run.name}")
+        print(f"W&B URL: {wandb_run.get_url()}")
+        print("=" * 60 + "\n")
+    else:
+        print("\n" + "=" * 60)
+        print("[W&B] Disabled: no W&B run will be created.")
+        print("[W&B] Local experiment metadata will still be saved.")
+        print("=" * 60 + "\n")
 
     # --------------------------------------------------------
     # TRAINING ENVIRONMENT
@@ -761,6 +870,7 @@ def main():
                 hybrid=args.hybrid,
                 env_type=args.env_type,
                 gui=args.gui,
+                lookahead_mode=args.lookahead_mode,
             )
 
             base = wrap_env(
@@ -812,6 +922,7 @@ def main():
             hybrid=args.hybrid,
             env_type=args.env_type,
             gui=args.gui,
+            lookahead_mode=args.lookahead_mode,
         )
 
         base = wrap_env(
@@ -899,10 +1010,19 @@ def main():
         else "end2end"
     )
 
-    model_name = (
-        f"{args.env_type}_{args.algorithm}_{mode}_"
-        f"seed{args.seed}_{args.exp_suffix}"
-    )
+    if args.hybrid:
+        model_name = (
+            f"{args.env_type}_{args.algorithm}_{mode}_"
+            f"la-{args.lookahead_mode}_"
+            f"seed{args.seed}_{args.exp_suffix}"
+        )
+    else:
+        model_name = (
+            f"{args.env_type}_{args.algorithm}_{mode}_"
+            f"seed{args.seed}_{args.exp_suffix}"
+        )
+
+   
 
     print(
         f"[Model] Name: {model_name}"
@@ -1031,12 +1151,16 @@ def main():
         verbose=1,
     )
 
-    wandb_callback = WandbCallback(
-        verbose=2,
-        model_save_path=f"./models/{model_name}",
-        model_save_freq=callback_eval_freq,
-        gradient_save_freq=1000,
-    )
+    callbacks = [eval_callback]
+
+    if wandb_run is not None:
+        wandb_callback = WandbCallback(
+            verbose=2,
+            model_save_path=f"./models/{model_name}",
+            model_save_freq=callback_eval_freq,
+            gradient_save_freq=1000,
+        )
+        callbacks.append(wandb_callback)
 
     # --------------------------------------------------------
     # TRAINING
@@ -1063,10 +1187,7 @@ def main():
 
     model.learn(
         total_timesteps=args.total_timesteps,
-        callback=[
-            eval_callback,
-            wandb_callback,
-        ],
+        callback=callbacks,
     )
 
     print(
@@ -1085,6 +1206,29 @@ def main():
     os.makedirs(
         model_dir,
         exist_ok=True,
+    )
+
+    metadata["paths"] = {
+        "final_model_dir": model_dir,
+        "best_model_dir": f"./models/{model_name}",
+        "tensorboard_dir": f"./tb_logs/{model_name}",
+        "evaluation_log_dir": f"./logs/{model_name}",
+    }
+
+    save_experiment_metadata(
+        os.path.join(
+            model_dir,
+            "experiment_metadata.json",
+        ),
+        metadata,
+    )
+
+    save_experiment_metadata(
+        os.path.join(
+            f"./models/{model_name}",
+            "experiment_metadata.json",
+        ),
+        metadata,
     )
 
     model.save(
@@ -1107,43 +1251,55 @@ def main():
     )
 
     # --------------------------------------------------------
+    # --------------------------------------------------------
     # W&B ARTIFACT
     # --------------------------------------------------------
-    model_artifact = wandb.Artifact(
-        "trained_model",
-        type="model",
-    )
+    if wandb_run is not None:
+        model_artifact = wandb.Artifact(
+            f"{model_name}_model",
+            type="model",
+            metadata={
+                "git_commit": git_hash,
+                "seed": args.seed,
+                "algorithm": args.algorithm,
+                "env_type": args.env_type,
+                "hybrid": args.hybrid,
+            },
+        )
 
-    model_artifact.add_file(
-        os.path.join(
-            model_dir,
+        for artifact_file in (
             "model.zip",
-        )
-    )
-
-    model_artifact.add_file(
-        os.path.join(
-            model_dir,
             "vecnormalize.pkl",
+            "experiment_metadata.json",
+        ):
+            model_artifact.add_file(
+                os.path.join(
+                    model_dir,
+                    artifact_file,
+                )
+            )
+
+        wandb_run.log_artifact(
+            model_artifact
         )
-    )
 
-    wandb_run.log_artifact(
-        model_artifact
-    )
+        print(
+            "[W&B] Model, VecNormalize, and metadata "
+            "artifacts uploaded."
+        )
 
-    print(
-        "[W&B] Model and VecNormalize "
-        "artifacts uploaded."
-    )
+        wandb_run.summary[
+            "final_model_path"
+        ] = model_dir
 
-    wandb_run.summary[
-        "final_model_path"
-    ] = model_dir
+        wandb_run.summary[
+            "total_timesteps"
+        ] = args.total_timesteps
 
-    wandb_run.summary[
-        "total_timesteps"
-    ] = args.total_timesteps
+    else:
+        print(
+            "[W&B] Disabled; no artifact uploaded."
+        )
 
     # --------------------------------------------------------
     # CLEANUP
@@ -1151,13 +1307,19 @@ def main():
     eval_env.close()
     env.close()
 
-    wandb_run.finish()
+    if wandb_run is not None:
+        wandb_run.finish()
 
-    print(
-        "\nW&B run finished. "
-        f"View results at: "
-        f"{wandb_run.get_url()}"
-    )
+        print(
+            "\nW&B run finished. "
+            f"View results at: "
+            f"{wandb_run.get_url()}"
+        )
+    else:
+        print(
+            "\nTraining run finished. "
+            "W&B was disabled; local metadata was saved."
+        )
 
 
 if __name__ == "__main__":

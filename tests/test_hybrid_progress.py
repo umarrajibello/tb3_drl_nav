@@ -11,133 +11,117 @@ def main():
 
         robot_pose = env.get_robot_pose()
 
-        print("\n=== HYBRID PROGRESS DIAGNOSTIC ===")
-        print(f"Initial robot pose: {robot_pose}")
+        print("\n=== HYBRID PATH-PROGRESS DIAGNOSTIC ===")
 
-        # Current waypoint is part of the hybrid navigation state.
-        waypoint = np.asarray(env.current_waypoint, dtype=np.float32)
+        print(
+            f"Initial robot pose: "
+            f"{robot_pose}"
+        )
 
-        print(f"Initial waypoint:   {waypoint}")
+        print(
+            f"Initial waypoint:   "
+            f"{env.current_waypoint}"
+        )
 
-        # Number of points in the current RRT path.
-        print(f"Initial path points: {len(env.path)}")
+        print(
+            f"Initial path points: "
+            f"{len(env.path) if env.path is not None else 0}"
+        )
 
-        print(f"Initial lookahead:  {env.current_lookahead:.3f}")
+        print(
+            f"Initial lookahead:  "
+            f"{env.current_lookahead:.3f}"
+        )
 
-        # ---------------------------------------------------------
-        # Initial projection of robot onto RRT path.
-        #
-        # _project_robot_onto_path() returns:
-        #
-        #   segment_index
-        #   interpolation
-        #   projection_point
-        #   path_arc_length
-        # ---------------------------------------------------------
-        #_, _, _, previous_arc = env._project_robot_onto_path(
-        #    np.asarray(robot_pose[:2], dtype=np.float32)
-        #)
-        previous_arc = env.debug_robot_arc
-
-
-
-        print(f"Initial path coordinate s: {previous_arc:.3f}")
+        print(
+            f"Initial path s:     "
+            f"{info.get('path_progress')}"
+        )
 
         print("\nColumns:")
+
         print(
             "step | "
             "robot_x | robot_y | "
-            "s | delta_s | "
-            "lookahead | "
-            "wp_dist | "
-            "reward"
+            "path_s | delta_s | "
+            "replan | lookahead | "
+            "wp_dist | reward"
         )
 
-        print("-" * 100)
+        print("-" * 110)
 
         for step in range(50):
 
-            # -----------------------------------------------------
-            # Manual control:
-            #
-            # action[0] = normalized linear velocity
-            # action[1] = normalized angular velocity
-            #
-            # Moderate forward motion, zero commanded rotation.
-            # -----------------------------------------------------
+            # Moderate forward motion,
+            # zero commanded angular velocity.
             action = np.array(
                 [0.5, 0.0],
                 dtype=np.float32,
             )
 
-            obs, reward, terminated, truncated, info = env.step(action)
+            (
+                obs,
+                reward,
+                terminated,
+                truncated,
+                info,
+            ) = env.step(action)
 
-            # -----------------------------------------------------
-            # Robot pose
-            # -----------------------------------------------------
-            robot_pose = env.get_robot_pose()
+            robot_pose = (
+                env.get_robot_pose()
+            )
 
-            robot_x = float(robot_pose[0])
-            robot_y = float(robot_pose[1])
-
-            # -----------------------------------------------------
-            # Current waypoint
-            # -----------------------------------------------------
             waypoint = np.asarray(
                 env.current_waypoint,
                 dtype=np.float32,
             )
 
-            waypoint_x = float(waypoint[0])
-            waypoint_y = float(waypoint[1])
-
-            # -----------------------------------------------------
-            # Robot-to-waypoint distance
-            # -----------------------------------------------------
             wp_dist = float(
                 np.linalg.norm(
-                    np.array(
-                        [robot_x, robot_y],
-                        dtype=np.float32,
-                    )
+                    robot_pose[:2]
                     - waypoint[:2]
                 )
             )
 
-            # -----------------------------------------------------
-            # Project robot onto RRT path
-            # -----------------------------------------------------
-            #_, _, _, current_arc = env._project_robot_onto_path(
-             #   np.asarray(
-              #      [robot_x, robot_y],
-               #     dtype=np.float32,
-                #)
-            #)
-            current_arc = env.debug_robot_arc
+            path_s = info.get(
+                "path_progress"
+            )
 
-            delta_arc = current_arc - previous_arc
+            delta_s = info.get(
+                "path_progress_delta"
+            )
 
-            
-            previous_arc = current_arc
+            replanned = info.get(
+                "path_replanned",
+                False,
+            )
 
-            # -----------------------------------------------------
-            # Print
-            # -----------------------------------------------------
             print(
                 f"{step:4d} | "
-                f"{robot_x:7.3f} | "
-                f"{robot_y:7.3f} | "
-                f"{current_arc:6.3f} | "
-                f"{delta_arc:+7.3f} | "
-                f"{env.current_lookahead:9.3f} | "
+                f"{robot_pose[0]:7.3f} | "
+                f"{robot_pose[1]:7.3f} | "
+                f"{path_s if path_s is not None else float('nan'):7.3f} | "
+                f"{delta_s:+7.3f} | "
+                f"{str(replanned):6s} | "
+                f"{info['lookahead_distance']:9.3f} | "
                 f"{wp_dist:7.3f} | "
                 f"{reward:+8.3f}"
             )
 
             if terminated or truncated:
+
                 print("\nEpisode ended.")
-                print(f"terminated = {terminated}")
-                print(f"truncated  = {truncated}")
+
+                print(
+                    f"terminated = "
+                    f"{terminated}"
+                )
+
+                print(
+                    f"truncated  = "
+                    f"{truncated}"
+                )
+
                 break
 
     finally:
