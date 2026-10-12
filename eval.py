@@ -1,22 +1,52 @@
 #!/usr/bin/env python3
 """
-Evaluation entry point for the thesis experiments.
+Motion-audit evaluator for the thesis experiments.
 
-Evaluation metrics:
+Purpose
+-------
+Validate physical-motion measurements independently of the reward audit.
+
+All transition-level robot state used after env.step() is read from
+the environment's transition info dictionary:
+
+    transition_linear_velocity
+    transition_angular_velocity
+    transition_robot_x
+    transition_robot_y
+    transition_robot_yaw
+
+This avoids reading the underlying environment after SB3/DummyVecEnv
+has automatically reset a terminated episode.
+
+Metrics
+-------
+Primary evaluation:
 - success rate
 - collision rate
 - timeout rate
-- dynamic-obstacle collision diagnostic
+- out-of-bounds rate
 - episode reward
 - episode steps
 - simulation/control duration
-- time to goal for successful episodes
+- time to goal
 - path length
 - path efficiency
 - final distance to goal
 - minimum LiDAR clearance
+
+Motion diagnostics:
+- mean commanded linear velocity
+- mean absolute commanded angular velocity
+- mean realized linear velocity
+- mean absolute realized angular velocity
+- commanded-realized linear velocity error
+- low-motion fraction
+- low-motion/stuck events
+- net displacement
+- motion efficiency
 - angular-velocity smoothness
-- stuck events
+
+This file deliberately does NOT require reward-audit instrumentation.
 """
 
 import argparse
@@ -45,10 +75,19 @@ from env.tb3_env_hybrid import TB3HybridEnv
 
 
 TEMPORAL_ALGORITHMS = {
-    "gru-sac",
+    "cnn-gru-sac",
     "lstm-sac",
     "tx-sac",
 }
+
+PHYSICS_STEPS_PER_ACTION = 8
+CONTROL_DT = PHYSICS_STEPS_PER_ACTION * TIME_STEP
+
+# Diagnostic only. 0.01 m/s is used as the near-zero-motion threshold.
+LOW_MOTION_THRESHOLD = 0.01
+
+# 50 control steps at the current control period.
+LOW_MOTION_EVENT_STEPS = 50
 
 
 def set_seed(seed):
@@ -91,13 +130,15 @@ def unwrap_original_env(env):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained policy with transition-level motion diagnostics."
+    )
 
     parser.add_argument(
         "--model_path",
         type=str,
         required=True,
-        help="Path to trained model .zip file.",
+        help="Path to trained model .zip file or model directory.",
     )
 
     parser.add_argument(
@@ -114,7 +155,7 @@ def parse_args():
         choices=[
             "sac",
             "ppo",
-            "gru-sac",
+            "cnn-gru-sac",
             "lstm-sac",
             "tx-sac",
         ],
@@ -140,7 +181,7 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=str,
-        default="eval_results.csv",
+        default="motion_audit_results.csv",
     )
 
     parser.add_argument(
@@ -153,58 +194,37 @@ def parse_args():
         "--vecnormalize_path",
         type=str,
         default=None,
-        help=(
-            "Optional explicit path to vecnormalize.pkl. "
-            "If omitted, the evaluator searches automatically."
-        ),
+        help="Optional explicit path to vecnormalize.pkl.",
     )
 
     return parser.parse_args()
 
 
 def resolve_model_path(model_path):
-    """
-    Resolve a Stable-Baselines3 model path.
-
-    Accepted inputs:
-      1. Direct .zip model path
-      2. Directory containing model.zip
-      3. Directory containing exactly one .zip model
-    """
     path = Path(model_path)
 
-    # Case 1: explicitly supplied .zip file
-    if path.is_file():
-        return path
+    if path.exists():
+        if path.is_dir():
+            candidate = path / "model.zip"
+            if candidate.exists():
+                return candidate
 
-    # Case 2: supplied model directory
-    if path.is_dir():
-        model_zip = path / "model.zip"
+            zips = sorted(path.glob("*.zip"))
+            if len(zips) == 1:
+                return zips[0]
 
-        if model_zip.is_file():
-            return model_zip
-
-        # Fallback: look for exactly one .zip file
-        zip_files = sorted(path.glob("*.zip"))
-
-        if len(zip_files) == 1:
-            return zip_files[0]
-
-        if len(zip_files) > 1:
             raise FileNotFoundError(
-                f"Multiple .zip model files found in directory: {path}\n"
-                f"Please specify the exact model .zip file."
+                f"Model directory does not contain a unique model zip: {path}"
             )
 
-        raise FileNotFoundError(
-            f"No model .zip file found in directory: {path}"
-        )
+        return path
 
-    # Case 3: path does not exist
-    raise FileNotFoundError(
-        f"Model path does not exist: {path}"
-    )
+    if path.suffix != ".zip":
+        zip_path = path.with_suffix(".zip")
+        if zip_path.exists():
+            return zip_path
 
+    raise FileNotFoundError(f"Model file not found: {path}")
 
 
 def find_vecnormalize_path(model_path, explicit_path=None):
@@ -219,14 +239,11 @@ def find_vecnormalize_path(model_path, explicit_path=None):
         return path
 
     model_path = Path(model_path)
-    candidates = []
-
-    candidates.append(
-        model_path.parent / "vecnormalize.pkl"
-    )
+    candidates = [
+        model_path.parent / "vecnormalize.pkl",
+    ]
 
     parent_name = model_path.parent.name
-
     candidates.append(
         model_path.parent.parent
         / f"{parent_name}_final"
@@ -245,33 +262,40 @@ def find_vecnormalize_path(model_path, explicit_path=None):
     return None
 
 
+def get_transition_value(info, key, default=None):
+    """Read a scalar transition value from SB3 info."""
+    if not isinstance(info, dict):
+        return default
+
+    value = info.get(key, default)
+
+    if value is None:
+        return default
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def main():
     args = parse_args()
 
     if args.num_episodes < 1:
-        raise ValueError(
-            "--num_episodes must be >= 1"
-        )
+        raise ValueError("--num_episodes must be >= 1")
 
     set_seed(args.seed)
 
-    print("\n" + "=" * 60)
-    print(
-        f"Evaluating {args.algorithm} "
-        f"on {args.env_type} environment"
-    )
+    print("\n" + "=" * 68)
+    print(f"Motion audit: {args.algorithm}")
+    print(f"Environment: {args.env_type}")
     print(f"Hybrid mode: {args.hybrid}")
     print(f"Episodes: {args.num_episodes}")
     print(f"Seed: {args.seed}")
-    print("=" * 60 + "\n")
+    print("=" * 68 + "\n")
 
-    model_path = resolve_model_path(
-        args.model_path
-    )
-
-    print(
-        f"[Eval] Using model: {model_path}"
-    )
+    model_path = resolve_model_path(args.model_path)
+    print(f"[MotionAudit] Using model: {model_path}")
 
     base_env = make_base_env(
         hybrid=args.hybrid,
@@ -280,18 +304,10 @@ def main():
     )
 
     if args.algorithm in TEMPORAL_ALGORITHMS:
-        base_env = TemporalObservationWrapper(
-            base_env
-        )
+        base_env = TemporalObservationWrapper(base_env)
+        print("[MotionAudit] TemporalObservationWrapper applied (history=8)")
 
-        print(
-            "[Eval] TemporalObservationWrapper applied "
-            "(history=8)"
-        )
-
-    env = DummyVecEnv(
-        [lambda: base_env]
-    )
+    env = DummyVecEnv([lambda: base_env])
 
     norm_path = find_vecnormalize_path(
         model_path,
@@ -300,18 +316,12 @@ def main():
 
     if norm_path is None:
         raise FileNotFoundError(
-            "\n[Eval] VecNormalize statistics were not found.\n"
-            "This model was trained with VecNormalize, so evaluation "
-            "should not continue without the training observation "
-            "statistics.\n"
-            "\nProvide the file explicitly with:\n"
+            "\n[MotionAudit] VecNormalize statistics were not found.\n"
+            "Provide them explicitly with:\n"
             "  --vecnormalize_path /path/to/vecnormalize.pkl\n"
         )
 
-    print(
-        "[Eval] Loading VecNormalize statistics from:\n"
-        f"       {norm_path}"
-    )
+    print(f"[MotionAudit] Loading VecNormalize: {norm_path}")
 
     env = VecNormalize.load(
         str(norm_path),
@@ -322,14 +332,13 @@ def main():
     env.norm_reward = False
 
     print(
-        "[Eval] VecNormalize configured:"
-        "\n       training=False"
-        "\n       norm_reward=False"
+        "[MotionAudit] VecNormalize configured: "
+        "training=False, norm_reward=False"
     )
 
     if args.algorithm in {
         "sac",
-        "gru-sac",
+        "cnn-gru-sac",
         "lstm-sac",
         "tx-sac",
     }:
@@ -343,36 +352,26 @@ def main():
             env=env,
         )
 
+    print("[MotionAudit] Model loaded successfully.")
+    print(f"[MotionAudit] Control timestep: {CONTROL_DT:.6f} s")
     print(
-        "[Eval] Model loaded successfully.\n"
+        "[MotionAudit] Transition state source: "
+        "info['transition_*']"
     )
 
     metrics = []
 
-    physics_steps_per_action = 8
-    control_dt = (
-        physics_steps_per_action * TIME_STEP
-    )
-
-    print(
-        f"[Eval] Control timestep: "
-        f"{control_dt:.6f} s"
-    )
-
     for ep in range(args.num_episodes):
         obs = env.reset()
+        obs = np.asarray(obs, dtype=np.float32)
 
-        obs = np.asarray(
-            obs,
-            dtype=np.float32,
-        )
+        original_env = unwrap_original_env(env)
 
-        original_env = unwrap_original_env(
-            env
-        )
-
+        # Reset-state queries are safe here because this is intentionally
+        # before the first transition of the episode.
+        start_pose = original_env.get_robot_pose()
         start_pos = np.array(
-            original_env.get_robot_pose()[:2],
+            start_pose[:2],
             dtype=np.float32,
         )
 
@@ -382,9 +381,7 @@ def main():
         )
 
         straight_line_dist = float(
-            np.linalg.norm(
-                goal_pos - start_pos
-            )
+            np.linalg.norm(goal_pos - start_pos)
         )
 
         done = False
@@ -393,11 +390,13 @@ def main():
         path_length = 0.0
 
         prev_pos = start_pos.copy()
+        final_transition_pos = start_pos.copy()
 
         collision = False
         dynamic_collision = False
-        out_of_bounds = False
         success = False
+        out_of_bounds = False
+        goal_reached_info = False
 
         commanded_linear_velocities = []
         commanded_angular_velocities = []
@@ -407,10 +406,9 @@ def main():
 
         min_distances = []
 
-        stuck_counter = 0
-        stuck_events = 0
-
-        goal_reached_info = False
+        low_motion_steps = 0
+        low_motion_counter = 0
+        low_motion_events = 0
 
         episode_start_time = time.time()
 
@@ -420,64 +418,28 @@ def main():
                 deterministic=True,
             )
 
-            normalized_action = np.asarray(action).reshape(-1)
-
-            if ep == 0 and steps < 20:
-                print(
-                    f"[Action diagnostic] step={steps:3d}, "
-                    f"a_v={normalized_action[0]: .4f}, "
-                    f"a_w={normalized_action[1]: .4f}"
-                )
-
             action = np.asarray(
                 action,
                 dtype=np.float32,
             )
 
             if action.ndim == 1:
-                action = action.reshape(
-                    1,
-                    -1,
-                )
+                action = action.reshape(1, -1)
 
-
-
-            linear_vel = float(
-                action[0][0] * LINEAR_VEL
-            )
-
-            ang_vel = float(
+            commanded_linear = float(
+                action[0][0] * LINEAR_VEL)
+            commanded_angular = float(
                 action[0][1] * ANGULAR_VEL
             )
 
-            # Record the command BEFORE stepping the simulator.
-            # Realized velocity is sampled AFTER env.step() so it corresponds
-            # to the motion produced during this control interval.
             commanded_linear_velocities.append(
-                linear_vel
+                commanded_linear
             )
-
             commanded_angular_velocities.append(
-                ang_vel
+                commanded_angular
             )
 
-            obs, reward, dones, infos = env.step(
-                action
-            )
-
-            # Measure physical robot velocity AFTER the action has been
-            # applied for the complete control interval.
-            real_linear_vel, real_angular_vel = (
-                original_env.get_robot_velocity()
-            )
-
-            realized_linear_velocities.append(
-                float(real_linear_vel)
-            )
-
-            realized_angular_velocities.append(
-                float(real_angular_vel)
-            )
+            obs, reward, dones, infos = env.step(action)
 
             obs = np.asarray(
                 obs,
@@ -493,58 +455,111 @@ def main():
             reward_value = float(
                 np.asarray(reward).reshape(-1)[0]
             )
-
             episode_reward += reward_value
             steps += 1
 
+            # ----------------------------------------------------------
+            # Critical motion-audit rule:
+            # Never query original_env.get_robot_pose() or
+            # original_env.get_robot_velocity() here.
+            #
+            # DummyVecEnv may already have reset the environment after
+            # a terminal transition. The instrumented environment
+            # captures the actual transition state before returning.
+            # ----------------------------------------------------------
+            transition_x = get_transition_value(
+                info,
+                "transition_robot_x",
+            )
+            transition_y = get_transition_value(
+                info,
+                "transition_robot_y",
+            )
+            transition_linear = get_transition_value(
+                info,
+                "transition_linear_velocity",
+            )
+            transition_angular = get_transition_value(
+                info,
+                "transition_angular_velocity",
+            )
+
+            if (
+                transition_x is None
+                or transition_y is None
+                or transition_linear is None
+                or transition_angular is None
+            ):
+                raise RuntimeError(
+                    "Motion-audit transition fields are missing. "
+                    "Run this evaluator only with the instrumented "
+                    "motion-audit environment files."
+                )
+
             curr_pos = np.array(
-                original_env.get_robot_pose()[:2],
+                [transition_x, transition_y],
                 dtype=np.float32,
             )
 
+            final_transition_pos = curr_pos.copy()
+
             step_dist = float(
-                np.linalg.norm(
-                    curr_pos - prev_pos
-                )
+                np.linalg.norm(curr_pos - prev_pos)
             )
 
             path_length += step_dist
             prev_pos = curr_pos
 
-            if step_dist < 0.01:
-                stuck_counter += 1
+            realized_linear_velocities.append(
+                transition_linear
+            )
+            realized_angular_velocities.append(
+                transition_angular
+            )
+
+            if (
+                abs(transition_linear)
+                < LOW_MOTION_THRESHOLD
+            ):
+                low_motion_steps += 1
+                low_motion_counter += 1
             else:
-                stuck_counter = 0
+                low_motion_counter = 0
 
-            if stuck_counter >= 50:
-                stuck_events += 1
-                stuck_counter = 0
+            if low_motion_counter >= LOW_MOTION_EVENT_STEPS:
+                low_motion_events += 1
+                low_motion_counter = 0
 
-            raw_lidar = np.asarray(
-                original_env.get_lidar(),
-                dtype=np.float32,
+            # Use the transition-captured LiDAR minimum if available.
+            # The motion-audit environment does not require reward-audit
+            # instrumentation, so capture LiDAR through the info field
+            # when present; otherwise use the post-step sensor only on
+            # non-terminal transitions.
+            transition_min_lidar = get_transition_value(
+                info,
+                "transition_min_lidar",
             )
 
-            raw_lidar = np.clip(
-                raw_lidar,
-                0.0,
-                1.0,
-            )
-
-            min_dist = float(
-                np.min(raw_lidar)
-                * LIDAR_RANGE
-            )
-
-            min_distances.append(
-                min_dist
-            )
+            if transition_min_lidar is not None:
+                min_distances.append(
+                    transition_min_lidar
+                )
+            elif not done:
+                raw_lidar = np.asarray(
+                    original_env.get_lidar(),
+                    dtype=np.float32,
+                )
+                raw_lidar = np.clip(
+                    raw_lidar,
+                    0.0,
+                    1.0,
+                )
+                min_distances.append(
+                    float(np.min(raw_lidar) * LIDAR_RANGE)
+                )
 
             if isinstance(info, dict):
-                if info.get(
-                    "collision",
-                    False,
-                ):
+                if info.get("collision", False):
                     collision = True
 
                     try:
@@ -559,36 +574,23 @@ def main():
                                 < COLLISION_DIST
                             ):
                                 dynamic_collision = True
-
                     except AttributeError:
                         pass
 
-                if info.get(
-                    "out_of_bounds",
-                    False,
-                ):
-                    out_of_bounds = True
-
-                if info.get(
-                    "reached_goal",
-                    False,
-                ):
+                if info.get("reached_goal", False):
                     goal_reached_info = True
 
+                if info.get("out_of_bounds", False):
+                    out_of_bounds = True
+
         episode_wall_time = (
-            time.time()
-            - episode_start_time
+            time.time() - episode_start_time
         )
 
-        final_pos = np.array(
-            original_env.get_robot_pose()[:2],
-            dtype=np.float32,
-        )
+        final_pos = final_transition_pos
 
         final_distance_to_goal = float(
-            np.linalg.norm(
-                final_pos - goal_pos
-            )
+            np.linalg.norm(final_pos - goal_pos)
         )
 
         if not collision:
@@ -607,9 +609,7 @@ def main():
         else:
             termination_reason = "timeout"
 
-        simulation_duration = (
-            steps * control_dt
-        )
+        simulation_duration = steps * CONTROL_DT
 
         if success:
             time_to_goal_s = simulation_duration
@@ -622,8 +622,7 @@ def main():
                     np.abs(
                         np.diff(
                             commanded_angular_velocities
-                        )   
-                        
+                        )
                     )
                 )
             )
@@ -637,34 +636,12 @@ def main():
         else:
             min_clearance = float("nan")
 
-
-        mean_commanded_linear_velocity = float(
-            np.mean(commanded_linear_velocities)
-        ) if commanded_linear_velocities else float("nan")
-
-        mean_abs_commanded_angular_velocity = float(
-            np.mean(
-                np.abs(commanded_angular_velocities)
+        if path_length > 1e-8:
+            path_efficiency = (
+                straight_line_dist / path_length
             )
-        ) if commanded_angular_velocities else float("nan")
-
-        mean_realized_linear_velocity = float(
-            np.mean(realized_linear_velocities)
-        ) if realized_linear_velocities else float("nan")
-
-        mean_abs_realized_angular_velocity = float(
-            np.mean(
-                np.abs(realized_angular_velocities)
-            )
-        ) if realized_angular_velocities else float("nan")
-
-        low_motion_fraction = float(
-            np.mean(
-                np.asarray(
-                    realized_linear_velocities
-                ) < 0.01
-            )
-        ) if realized_linear_velocities else float("nan")
+        else:
+            path_efficiency = 0.0
 
         net_displacement = float(
             np.linalg.norm(
@@ -672,24 +649,51 @@ def main():
             )
         )
 
-        motion_efficiency = (
-            net_displacement / path_length
-            if path_length > 1e-8
-            else float("nan")
-        )
-
-
-
-        
-
-        if success and path_length > 1e-8:
-            path_efficiency = (
-            straight_line_dist
-            / path_length
+        if path_length > 1e-8:
+            motion_efficiency = (
+                net_displacement / path_length
             )
         else:
-            path_efficiency = float("nan")
+            motion_efficiency = 0.0
 
+        mean_commanded_linear = float(
+            np.mean(commanded_linear_velocities)
+        )
+
+        mean_abs_commanded_angular = float(
+            np.mean(
+                np.abs(commanded_angular_velocities)
+            )
+        )
+
+        mean_realized_linear = float(
+            np.mean(realized_linear_velocities)
+        )
+
+        mean_abs_realized_angular = float(
+            np.mean(
+                np.abs(realized_angular_velocities)
+            )
+        )
+
+        mean_abs_linear_tracking_error = float(
+            np.mean(
+                np.abs(
+                    np.asarray(
+                        commanded_linear_velocities
+                    )
+                    - np.asarray(
+                        realized_linear_velocities
+                    )
+                )
+            )
+        )
+
+        low_motion_fraction = (
+            low_motion_steps / steps
+            if steps > 0
+            else 0.0
+        )
 
         metrics.append(
             {
@@ -707,72 +711,58 @@ def main():
                 "path_length": path_length,
                 "path_efficiency": path_efficiency,
                 "final_distance_to_goal": final_distance_to_goal,
-                "smoothness_jerk": angular_jerk,
                 "min_clearance": min_clearance,
-                "stuck_events": stuck_events,
-                "mean_commanded_linear_velocity":
-                    mean_commanded_linear_velocity,
-                "mean_abs_commanded_angular_velocity":
-                    mean_abs_commanded_angular_velocity,
-                "mean_realized_linear_velocity":
-                    mean_realized_linear_velocity,
-                "mean_abs_realized_angular_velocity":
-                    mean_abs_realized_angular_velocity,
-                "low_motion_fraction":
-                    low_motion_fraction,
-                "net_displacement":
-                    net_displacement,
-                "motion_efficiency":
-                    motion_efficiency,
+                "smoothness_jerk": angular_jerk,
+                "stuck_events": low_motion_events,
+                "low_motion_fraction": low_motion_fraction,
+                "mean_commanded_linear_velocity": mean_commanded_linear,
+                "mean_abs_commanded_angular_velocity": mean_abs_commanded_angular,
+                "mean_realized_linear_velocity": mean_realized_linear,
+                "mean_abs_realized_angular_velocity": mean_abs_realized_angular,
+                "mean_abs_linear_velocity_error": mean_abs_linear_tracking_error,
+                "net_displacement": net_displacement,
+                "motion_efficiency": motion_efficiency,
             }
         )
 
         print(
             f"Episode {ep:3d}: "
-            f"result={termination_reason:8s}, "
+            f"result={termination_reason:12s}, "
             f"steps={steps:4d}, "
             f"reward={episode_reward:8.3f}, "
             f"final_dist={final_distance_to_goal:.3f} m, "
-            f"eff={path_efficiency:.3f}, "
-            f"jerk={angular_jerk:.3f}, "
-            f"clearance={min_clearance:.3f} m, "
-            f"stuck={stuck_events}"
+            f"path={path_length:.3f} m, "
+            f"cmd_v={mean_commanded_linear:.3f}, "
+            f"real_v={mean_realized_linear:.3f}, "
+            f"low_motion={low_motion_fraction:.3f}, "
+            f"stuck={low_motion_events}"
         )
 
-    if metrics:
-        output_path = Path(
-            args.output
+    output_path = Path(args.output)
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with open(
+        output_path,
+        "w",
+        newline="",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=metrics[0].keys(),
         )
-
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        with open(
-            output_path,
-            "w",
-            newline="",
-        ) as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=metrics[0].keys(),
-            )
-
-            writer.writeheader()
-            writer.writerows(metrics)
+        writer.writeheader()
+        writer.writerows(metrics)
 
     success_rate = (
-        np.mean(
-            [m["success"] for m in metrics]
-        )
+        np.mean([m["success"] for m in metrics])
         * 100.0
     )
 
     collision_rate = (
-        np.mean(
-            [m["collision"] for m in metrics]
-        )
+        np.mean([m["collision"] for m in metrics])
         * 100.0
     )
 
@@ -787,21 +777,13 @@ def main():
     )
 
     out_of_bounds_rate = (
-        np.mean(
-            [
-                m["termination_reason"] == "out_of_bounds"
-                for m in metrics
-            ]
-        )
+        np.mean([m["out_of_bounds"] for m in metrics])
         * 100.0
     )
 
     dynamic_collision_rate = (
         np.mean(
-            [
-                m["dynamic_collision"]
-                for m in metrics
-            ]
+            [m["dynamic_collision"] for m in metrics]
         )
         * 100.0
     )
@@ -818,25 +800,21 @@ def main():
         [m["path_length"] for m in metrics]
     )
 
-    efficiency_values = [
+    successful_efficiencies = [
         m["path_efficiency"]
         for m in metrics
-        if np.isfinite(m["path_efficiency"])
+        if m["success"]
     ]
 
-    avg_efficiency = (
-        float(np.mean(efficiency_values))
-        if efficiency_values
-        else float("nan")
-    )
-
-    
+    if successful_efficiencies:
+        avg_efficiency = float(
+            np.mean(successful_efficiencies)
+        )
+    else:
+        avg_efficiency = float("nan")
 
     avg_final_distance = np.mean(
-        [
-            m["final_distance_to_goal"]
-            for m in metrics
-        ]
+        [m["final_distance_to_goal"] for m in metrics]
     )
 
     avg_clearance = np.mean(
@@ -847,13 +825,44 @@ def main():
         [m["stuck_events"] for m in metrics]
     )
 
+    avg_low_motion_fraction = np.mean(
+        [m["low_motion_fraction"] for m in metrics]
+    )
+
+    avg_cmd_v = np.mean(
+        [
+            m["mean_commanded_linear_velocity"]
+            for m in metrics
+        ]
+    )
+
+    avg_real_v = np.mean(
+        [
+            m["mean_realized_linear_velocity"]
+            for m in metrics
+        ]
+    )
+
+    avg_linear_error = np.mean(
+        [
+            m["mean_abs_linear_velocity_error"]
+            for m in metrics
+        ]
+    )
+
+    avg_net_displacement = np.mean(
+        [m["net_displacement"] for m in metrics]
+    )
+
+    avg_motion_efficiency = np.mean(
+        [m["motion_efficiency"] for m in metrics]
+    )
+
     successful_times = [
         m["time_to_goal_s"]
         for m in metrics
         if m["success"]
-        and math.isfinite(
-            m["time_to_goal_s"]
-        )
+        and math.isfinite(m["time_to_goal_s"])
     ]
 
     if successful_times:
@@ -863,86 +872,87 @@ def main():
     else:
         avg_time_to_goal = float("nan")
 
-    print("\n" + "=" * 60)
-    print("EVALUATION SUMMARY")
-    print("=" * 60)
+    print("\n" + "=" * 68)
+    print("MOTION AUDIT SUMMARY")
+    print("=" * 68)
 
+    print(f"Success rate:                  {success_rate:.1f}%")
+    print(f"Collision rate:                {collision_rate:.1f}%")
+    print(f"Timeout rate:                  {timeout_rate:.1f}%")
+    print(f"Out-of-bounds rate:            {out_of_bounds_rate:.1f}%")
     print(
-        f"Success rate:                 "
-        f"{success_rate:.1f}%"
-    )
-
-    print(
-        f"Collision rate:               "
-        f"{collision_rate:.1f}%"
-    )
-
-    print(
-        f"Timeout rate:                 "
-        f"{timeout_rate:.1f}%"
-    )
-
-    print(
-        f"Out-of-bounds rate:            "
-        f"{out_of_bounds_rate:.1f}%"
-    )
-
-    print(
-        f"Dynamic-collision diagnostic: "
+        f"Dynamic-collision diagnostic:  "
         f"{dynamic_collision_rate:.1f}%"
     )
+    print(f"Average episode reward:        {avg_reward:.3f}")
+    print(f"Average steps:                 {avg_steps:.1f}")
+    print(f"Average path length:           {avg_path_length:.3f} m")
+
+    if math.isfinite(avg_efficiency):
+        print(
+            f"Average successful path efficiency: "
+            f"{avg_efficiency:.3f}"
+        )
+    else:
+        print(
+            "Average successful path efficiency: N/A"
+        )
 
     print(
-        f"Average episode reward:       "
-        f"{avg_reward:.3f}"
-    )
-
-    print(
-        f"Average steps:                "
-        f"{avg_steps:.1f}"
-    )
-
-    print(
-        f"Average path length:          "
-        f"{avg_path_length:.3f} m"
-    )
-
-    print(
-        f"Average path efficiency:      "
-        f"{avg_efficiency:.3f}"
-    )
-
-    print(
-        f"Average final goal distance:  "
+        f"Average final goal distance:   "
         f"{avg_final_distance:.3f} m"
     )
 
     print(
-        f"Average min clearance:        "
+        f"Average minimum clearance:     "
         f"{avg_clearance:.3f} m"
     )
 
     if math.isfinite(avg_time_to_goal):
         print(
-            f"Average time to goal:         "
+            f"Average time to goal:          "
             f"{avg_time_to_goal:.3f} s"
         )
     else:
-        print(
-            "Average time to goal:         N/A"
-        )
+        print("Average time to goal:          N/A")
 
     print(
-        f"Average stuck events:         "
+        f"Average commanded linear v:    "
+        f"{avg_cmd_v:.4f} m/s"
+    )
+
+    print(
+        f"Average realized linear v:     "
+        f"{avg_real_v:.4f} m/s"
+    )
+
+    print(
+        f"Mean |commanded-realized v|:   "
+        f"{avg_linear_error:.4f} m/s"
+    )
+
+    print(
+        f"Average low-motion fraction:   "
+        f"{avg_low_motion_fraction:.3f}"
+    )
+
+    print(
+        f"Average low-motion events:     "
         f"{avg_stuck:.2f}"
     )
 
     print(
-        f"Results saved to:             "
-        f"{args.output}"
+        f"Average net displacement:      "
+        f"{avg_net_displacement:.3f} m"
     )
 
-    print("=" * 60 + "\n")
+    print(
+        f"Average motion efficiency:     "
+        f"{avg_motion_efficiency:.3f}"
+    )
+
+    print(f"Results saved to:              {args.output}")
+    print("=" * 68 + "\n")
 
 
 if __name__ == "__main__":

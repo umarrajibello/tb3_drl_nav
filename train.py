@@ -32,6 +32,7 @@ Important:
 
 import argparse
 import json
+import copy
 import os
 import random
 import subprocess
@@ -51,7 +52,7 @@ from stable_baselines3.common.vec_env import (
     SubprocVecEnv,
     VecNormalize,
 )
-
+from policies.grad_clip_sac import GradClipSAC
 from config import OBSERVATION_HISTORY
 from env.observation_wrapper import TemporalObservationWrapper
 from env.tb3_env import TB3Env
@@ -79,6 +80,20 @@ def parse_args():
         type=str,
         default="mixed",
         choices=["empty", "static", "mixed", "dense"],
+    )
+
+    parser.add_argument(
+        "--goal_dist_min",
+        type=float,
+        default=None,
+        help="Minimum allowed start-to-goal distance in meters.",
+    )
+
+    parser.add_argument(
+        "--goal_dist_max",
+        type=float,
+        default=None,
+        help="Maximum allowed start-to-goal distance in meters.",
     )
 
     parser.add_argument(
@@ -164,6 +179,10 @@ def parse_args():
         "--pretrained",
         type=str,
         default=None,
+        help=(
+            "Path to a pretrained model.zip. When supplied, the matching "
+            "vecnormalize.pkl is automatically loaded from the same directory."
+        ),
     )
 
     parser.add_argument(
@@ -190,6 +209,32 @@ def parse_args():
             "Number of SAC gradient updates after each rollout step. "
             "Use -1 to perform one gradient update per collected "
             "environment transition."
+        ),
+    )
+    parser.add_argument(
+        "--norm_reward",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Enable VecNormalize reward normalization (true/false).",
+    )
+
+    parser.add_argument(
+        "--ent_coef",
+        type=str,
+        default=None,
+        help=(
+            "Override SAC entropy coefficient. "
+            "Examples: 'auto_0.5', 'auto_0.1', '0.01'."
+        ),
+    )
+
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=None,
+        help=(
+            "If set, clip actor and critic gradients to this norm. "
+            "Example: 1.0. Leave unset to disable."
         ),
     )
 
@@ -303,7 +348,10 @@ def set_seed(seed):
 # ============================================================
 # BASE ENVIRONMENT FACTORY
 # ============================================================
-def make_base_env(hybrid: bool, env_type: str, gui: bool, lookahead_mode: str = "velocity_clearance",):
+def make_base_env(hybrid: bool, env_type: str, gui: bool, 
+                  lookahead_mode: str = "velocity_clearance", 
+                  goal_dist_min=None,
+                  goal_dist_max=None,):
     """
     Create the committed E2E or hybrid environment.
 
@@ -317,11 +365,15 @@ def make_base_env(hybrid: bool, env_type: str, gui: bool, lookahead_mode: str = 
             env_type=env_type,
             render_mode=render_mode,
             lookahead_mode=lookahead_mode,
+            goal_dist_min=goal_dist_min,
+            goal_dist_max=goal_dist_max,
         )
 
     return TB3Env(
         env_type=env_type,
         render_mode=render_mode,
+        goal_dist_min=goal_dist_min,
+        goal_dist_max=goal_dist_max,
     )
 
 
@@ -417,6 +469,8 @@ def make_env_fn(
             env_type=env_type,
             gui=gui,
             lookahead_mode=args.lookahead_mode,
+            goal_dist_min=args.goal_dist_min,
+            goal_dist_max=args.goal_dist_max,
         )
 
         env = wrap_env(
@@ -590,7 +644,19 @@ def build_experiment_metadata(
             "observation_history": OBSERVATION_HISTORY,
             "planner_update_freq": config.PLANNER_UPDATE_FREQ,
             "waypoint_distance": config.WAYPOINT_DISTANCE,
+            "goal_dist_min": (
+                config.GOAL_DIST_MIN
+                if args.goal_dist_min is None
+                else args.goal_dist_min
+            ),
+            "goal_dist_max": (
+                config.GOAL_DIST_MAX
+                if args.goal_dist_max is None
+                else args.goal_dist_max
+            ),
+            
         },
+
 
         "training": {
             "algorithm": args.algorithm,
@@ -600,12 +666,23 @@ def build_experiment_metadata(
             "seed": args.seed,
             "gradient_steps": args.gradient_steps,
             "pretrained": args.pretrained,
+            "pretrained_vecnormalize": (
+                os.path.join(
+                    os.path.dirname(os.path.abspath(args.pretrained)),
+                    "vecnormalize.pkl",
+                )
+                if args.pretrained
+                else None
+            ),
             "learning_rate": learning_rate,
             "batch_size": batch_size,
             "buffer_size": buffer_size,
             "gamma": 0.99,
             "tau": 0.005,
             "ent_coef": ent_coef,
+            "norm_reward": bool(args.norm_reward),
+            "ent_coef_override": args.ent_coef,
+            "grad_clip": args.grad_clip,
         },
 
         "reward": {
@@ -666,6 +743,33 @@ def save_experiment_metadata(path, metadata):
 # ============================================================
 def main():
     args = parse_args()
+
+
+    if (
+        args.goal_dist_min is not None
+        and args.goal_dist_min < 0
+    ):
+        raise ValueError(
+            "--goal_dist_min must be >= 0."
+        )
+
+    if (
+        args.goal_dist_max is not None
+        and args.goal_dist_max < 0
+    ):
+        raise ValueError(
+            "--goal_dist_max must be >= 0."
+        )
+
+    if (
+        args.goal_dist_min is not None
+        and args.goal_dist_max is not None
+        and args.goal_dist_min > args.goal_dist_max
+    ):
+        raise ValueError(
+            "--goal_dist_min cannot be greater than "
+            "--goal_dist_max."
+        )
 
     # --------------------------------------------------------
     # Basic validation
@@ -768,6 +872,8 @@ def main():
         learning_rate = 3e-4
         buffer_size = 300000
         ent_coef = "auto_0.5"
+        if args.ent_coef is not None:
+            ent_coef = args.ent_coef
 
     elif args.algorithm == "ppo":
         learning_rate = 3e-4
@@ -871,6 +977,8 @@ def main():
                 env_type=args.env_type,
                 gui=args.gui,
                 lookahead_mode=args.lookahead_mode,
+                goal_dist_min=args.goal_dist_min,
+                goal_dist_max=args.goal_dist_max,
             )
 
             base = wrap_env(
@@ -897,20 +1005,90 @@ def main():
             "[Env] Created single environment "
             "using DummyVecEnv."
         )
-
+ 
     # --------------------------------------------------------
     # VecNormalize
     # --------------------------------------------------------
-    env = VecNormalize(
-        env,
-        norm_obs=True,
-        norm_reward=True,
-    )
+    #
+    # For a fresh run:
+    #     create new normalization statistics.
+    #
+    # For curriculum transfer:
+    #     load the normalization statistics produced by the
+    #     pretrained stage.
+    #
+    # This is important because the policy parameters are trained
+    # against normalized observations. Transferring the policy
+    # without transferring VecNormalize statistics can change the
+    # effective input distribution seen by the transferred policy.
+    # --------------------------------------------------------
 
-    print(
-        "[Env] VecNormalize added "
-        "(norm_obs=True, norm_reward=True)"
-    )
+    if args.pretrained:
+
+        pretrained_model_path = os.path.abspath(
+            args.pretrained
+        )
+
+        pretrained_dir = os.path.dirname(
+            pretrained_model_path
+        )
+
+        pretrained_vecnormalize = os.path.join(
+            pretrained_dir,
+            "vecnormalize.pkl",
+        )
+
+        if not os.path.isfile(
+            pretrained_vecnormalize
+        ):
+            raise FileNotFoundError(
+                "Pretrained model was supplied, but the matching "
+                "VecNormalize file was not found:\n"
+                f"  Model:       {pretrained_model_path}\n"
+                f"  VecNormalize:{pretrained_vecnormalize}\n"
+                "\n"
+                "The curriculum stage must provide both model.zip "
+                "and vecnormalize.pkl."
+            )
+
+        env = VecNormalize.load(
+            pretrained_vecnormalize,
+            env,
+        )
+
+        # Continue updating normalization statistics during the
+        # new curriculum stage.
+        env.training = True
+
+        # Training must continue with reward normalization enabled,
+        # matching the original training configuration.
+        env.norm_reward = True
+
+        print(
+            "[Env] Loaded pretrained VecNormalize statistics:"
+        )
+        print(
+            f"      {pretrained_vecnormalize}"
+        )
+        print(
+            "[Env] VecNormalize training=True, "
+            "norm_reward=True"
+        )
+
+    else:
+
+        env = VecNormalize(
+            env,
+            norm_obs=True,
+            norm_reward=args.norm_reward,
+        )
+
+        print(
+            "[Env] Created fresh VecNormalize "
+            f"(norm_obs=True, norm_reward={args.norm_reward})"
+        )
+
+
 
     # --------------------------------------------------------
     # EVALUATION ENVIRONMENT
@@ -923,6 +1101,8 @@ def main():
             env_type=args.env_type,
             gui=args.gui,
             lookahead_mode=args.lookahead_mode,
+            goal_dist_min=args.goal_dist_min,
+            goal_dist_max=args.goal_dist_max
         )
 
         base = wrap_env(
@@ -954,17 +1134,29 @@ def main():
         norm_reward=False,
     )
 
-    # Evaluation uses training observation statistics.
+    # --------------------------------------------------------
+    # Evaluation normalization
+    # --------------------------------------------------------
+    #
+    # Share the training observation-statistics object so that
+    # evaluation always uses the latest statistics accumulated
+    # by the training environment.
+    #
+    # Evaluation itself does not update the statistics because
+    # training=False.
+    # --------------------------------------------------------
+
     eval_env.obs_rms = env.obs_rms
 
-    # Do not update normalization statistics during evaluation.
     eval_env.training = False
-
-    # We want the original reward scale during evaluation.
     eval_env.norm_reward = False
 
     print(
-        "[Eval] Using training observation normalization statistics."
+        "[Eval] Sharing training VecNormalize "
+        "observation statistics."
+    )
+    print(
+        "[Eval] Evaluation normalization updates disabled."
     )
     print(
         "[Eval] Reward normalization disabled."
@@ -1046,8 +1238,14 @@ def main():
     )
 
     if args.algorithm == "sac":
+        
+        sac_class = SAC
+        sac_kwargs = {}
+        if args.grad_clip is not None:
+            sac_class = GradClipSAC
+            sac_kwargs["max_grad_norm"] = args.grad_clip
 
-        model = SAC(
+        model = sac_class(
             "MlpPolicy",
             env,
             learning_rate=learning_rate,
@@ -1062,6 +1260,7 @@ def main():
             tensorboard_log=f"./tb_logs/{model_name}",
             device=device,
             seed=args.seed,
+            **sac_kwargs,
         )
 
     elif args.algorithm == "ppo":
@@ -1088,8 +1287,18 @@ def main():
         )
 
     else:
+        sac_class = SAC
+        sac_kwargs = {}
 
-        model = SAC(
+        if args.grad_clip is not None:
+            sac_class = GradClipSAC
+            sac_kwargs["max_grad_norm"] = args.grad_clip
+            print(
+                f"[Model] Gradient clipping enabled: "
+                f"max_grad_norm={args.grad_clip}"
+            )
+
+        model = sac_class(
             "MlpPolicy",
             env,
             learning_rate=learning_rate,
@@ -1105,38 +1314,75 @@ def main():
             tensorboard_log=f"./tb_logs/{model_name}",
             device=device,
             seed=args.seed,
+            **sac_kwargs,
         )
 
     # --------------------------------------------------------
     # PRETRAINED PARAMETERS
     # --------------------------------------------------------
+   
     if args.pretrained:
 
-        if not os.path.isfile(
+        pretrained_model_path = os.path.abspath(
             args.pretrained
+        )
+
+        if not os.path.isfile(
+            pretrained_model_path
         ):
             raise FileNotFoundError(
                 f"Pretrained model not found: "
-                f"{args.pretrained}"
+                f"{pretrained_model_path}"
             )
 
+        pretrained_vecnormalize = os.path.join(
+            os.path.dirname(pretrained_model_path),
+            "vecnormalize.pkl",
+        )
+
+        # The VecNormalize file should already have been checked
+        # when constructing the training environment.
+        if not os.path.isfile(
+            pretrained_vecnormalize
+        ):
+            raise FileNotFoundError(
+                "Matching pretrained VecNormalize file not found: "
+                f"{pretrained_vecnormalize}"
+            )
+
+        # ----------------------------------------------------
+        # Transfer neural-network parameters.
+        #
+        # We intentionally use set_parameters() rather than
+        # loading the complete SB3 model because each curriculum
+        # stage is treated as a new training stage with its own
+        # replay buffer.
+        # ----------------------------------------------------
         model.set_parameters(
-            args.pretrained
+            pretrained_model_path
         )
 
-        wandb_run.config.update(
-            {
-                "pretrained_model": args.pretrained
-            },
-            allow_val_change=True,
+        if wandb_run is not None:
+            wandb_run.config.update(
+                {
+                    "pretrained_model": pretrained_model_path,
+                    "pretrained_vecnormalize": pretrained_vecnormalize,
+                },
+                allow_val_change=True,
+            )
+
+        print(
+            "[Transfer] Loaded pretrained policy parameters:"
+        )
+        print(
+            f"           {pretrained_model_path}"
         )
 
         print(
-            "[Model] Loaded pretrained neural-network "
-            "parameters from:"
+            "[Transfer] Loaded pretrained VecNormalize statistics:"
         )
         print(
-            f"        {args.pretrained}"
+            f"           {pretrained_vecnormalize}"
         )
 
     # --------------------------------------------------------

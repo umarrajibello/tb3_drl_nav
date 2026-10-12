@@ -1,0 +1,153 @@
+*** Begin Patch
+*** Update File: env/tb3_env.py
+@@
+     DYNAMIC_CONFIG,
+     ENV_TYPE,
++    GOAL_DIST_MIN,
++    GOAL_DIST_MAX,
+ )
+@@
+-    def __init__(self, render_mode=None, env_type=None, gui=None):
++    def __init__(
++        self,
++        render_mode=None,
++        env_type=None,
++        gui=None,
++        goal_dist_min=None,
++        goal_dist_max=None,
++    ):
+         super().__init__()
+ 
+         self.render_mode = render_mode
+         self.env_type = ENV_TYPE if env_type is None else env_type
++
++        # Curriculum-controlled start-to-goal distance.
++        # If the CLI does not provide a range, preserve the config defaults.
++        self.goal_dist_min = (
++            GOAL_DIST_MIN
++            if goal_dist_min is None
++            else float(goal_dist_min)
++        )
++        self.goal_dist_max = (
++            GOAL_DIST_MAX
++            if goal_dist_max is None
++            else float(goal_dist_max)
++        )
++
++        if self.goal_dist_min < 0 or self.goal_dist_max < 0:
++            raise ValueError("Goal-distance limits must be >= 0.")
++        if self.goal_dist_min > self.goal_dist_max:
++            raise ValueError(
++                "goal_dist_min cannot be greater than goal_dist_max."
++            )
+*** Update File: env/tb3_env_hybrid.py
+@@
+     def __init__(
+         self,
+         render_mode=None,
+         env_type=None,
+         lookahead_mode="velocity_clearance",
++        goal_dist_min=None,
++        goal_dist_max=None,
+     ):
+         super().__init__(
+             render_mode=render_mode,
+             env_type=env_type,
++            goal_dist_min=goal_dist_min,
++            goal_dist_max=goal_dist_max,
+         )
+*** Update File: train.py
+@@
+-    env = VecNormalize(
+-        env,
+-        norm_obs=True,
+-        norm_reward=True,
+-    )
++    env = VecNormalize(
++        env,
++        norm_obs=True,
++        norm_reward=True,
++    )
++
++    # --------------------------------------------------------
++    # CURRICULUM NORMALIZATION TRANSFER
++    # --------------------------------------------------------
++    # Within an MC curriculum, C2-C7 reuse the previous stage's
++    # policy parameters.  Reuse the corresponding VecNormalize
++    # statistics as well so the observation scale is continuous
++    # across curriculum stages.
++    #
++    # Do NOT carry this across MC0 -> MC1 -> MC2 -> MC3: each MC
++    # intentionally starts from a fresh policy architecture/lookahead
++    # configuration at C1.
++    if args.pretrained:
++        pretrained_dir = os.path.dirname(
++            os.path.abspath(args.pretrained)
++        )
++        pretrained_vecnorm = os.path.join(
++            pretrained_dir,
++            "vecnormalize.pkl",
++        )
++
++        if os.path.isfile(pretrained_vecnorm):
++            print(
++                "[Curriculum] Loading VecNormalize statistics from: "
++                f"{pretrained_vecnorm}"
++            )
++            env = VecNormalize.load(
++                pretrained_vecnorm,
++                env,
++            )
++            env.training = True
++            env.norm_reward = True
++        else:
++            print(
++                "[Curriculum] WARNING: pretrained model supplied but "
++                "vecnormalize.pkl was not found. Starting with fresh "
++                "normalization statistics."
++            )
+*** Update File: tb3_curriculum_scripts/run_seed42_gpu0.sh
+@@
+     local steps="$8"
+     local pretrained="${9:-}"
++
++    # C1 of every MC is intentionally fresh.  C2-C7 automatically
++    # continue from the immediately preceding stage unless an explicit
++    # checkpoint is supplied as argument 9.
++    if [[ "${label}" != "C1" && -z "${pretrained}" ]]; then
++        pretrained="${prev:-}"
++    fi
+*** Update File: tb3_curriculum_scripts/run_seed43_gpu1.sh
+@@
+     local steps="$8"
+     local pretrained="${9:-}"
++
++    # C1 of every MC is intentionally fresh.  C2-C7 automatically
++    # continue from the immediately preceding stage unless an explicit
++    # checkpoint is supplied as argument 9.
++    if [[ "${label}" != "C1" && -z "${pretrained}" ]]; then
++        pretrained="${prev:-}"
++    fi
+*** Update File: tb3_curriculum_scripts/run_seed44_gpu2.sh
+@@
+     local steps="$8"
+     local pretrained="${9:-}"
++
++    # C1 of every MC is intentionally fresh.  C2-C7 automatically
++    # continue from the immediately preceding stage unless an explicit
++    # checkpoint is supplied as argument 9.
++    if [[ "${label}" != "C1" && -z "${pretrained}" ]]; then
++        pretrained="${prev:-}"
++    fi
+*** Update File: tb3_curriculum_scripts/run_seed45_gpu3.sh
+@@
+     local steps="$8"
+     local pretrained="${9:-}"
++
++    # C1 of every MC is intentionally fresh.  C2-C7 automatically
++    # continue from the immediately preceding stage unless an explicit
++    # checkpoint is supplied as argument 9.
++    if [[ "${label}" != "C1" && -z "${pretrained}" ]]; then
++        pretrained="${prev:-}"
++    fi
+*** End Patch

@@ -1,0 +1,77 @@
+{
+  "environment": {
+    "collision_distance": 0.15,
+    "env_type": "static",
+    "goal_dist_max": 1.5,
+    "goal_dist_min": 0.8,
+    "goal_threshold": 0.2,
+    "gui": false,
+    "hybrid": true,
+    "lidar_range": 3.5,
+    "lidar_rays": 36,
+    "lookahead_mode": "velocity_clearance",
+    "max_steps": 5000,
+    "num_envs": 1,
+    "observation_history": 8,
+    "planner_update_freq": 50,
+    "waypoint_distance": 1.0
+  },
+  "git_commit": "e35d2ca0",
+  "observation": {
+    "base_dim": 41,
+    "history_length": 8,
+    "temporal_dim": 328
+  },
+  "paths": {
+    "best_model_dir": "./models/static_tx-sac_hybrid_la-velocity_clearance_seed45_MC3_C2",
+    "evaluation_log_dir": "./logs/static_tx-sac_hybrid_la-velocity_clearance_seed45_MC3_C2",
+    "final_model_dir": "./models/static_tx-sac_hybrid_la-velocity_clearance_seed45_MC3_C2_final",
+    "tensorboard_dir": "./tb_logs/static_tx-sac_hybrid_la-velocity_clearance_seed45_MC3_C2"
+  },
+  "reward": {
+    "clearance_weight": 1.0,
+    "collision_penalty": 10.0,
+    "goal_reward": 10.0,
+    "progress_weight": 2.0,
+    "step_penalty": 0.01
+  },
+  "system": {
+    "cuda_available": true,
+    "cuda_device_count": 1,
+    "cuda_device_name": "NVIDIA GeForce RTX 4090",
+    "device": "cuda",
+    "numpy_version": "2.2.6",
+    "python_version": "3.10.20",
+    "torch_version": "2.3.1+cu121"
+  },
+  "timestamp": "2026-10-06T04:46:46",
+  "tracking": {
+    "exp_suffix": "MC3_C2",
+    "wandb_mode": "online",
+    "wandb_project": "tb3-nav-research",
+    "wandb_tags": [
+      "main",
+      "curriculum",
+      "MC3",
+      "C2",
+      "seed45",
+      "static"
+    ]
+  },
+  "training": {
+    "algorithm": "tx-sac",
+    "batch_size": 256,
+    "buffer_size": 300000,
+    "callback_eval_freq": 10000,
+    "ent_coef": "auto_0.5",
+    "eval_freq_transitions": 10000,
+    "gamma": 0.99,
+    "gradient_steps": 1,
+    "learning_rate": 0.0003,
+    "pretrained": "./models/empty_tx-sac_hybrid_la-velocity_clearance_seed45_MC3_C1_final/model.zip",
+    "pretrained_vecnormalize": "/home/rj/tb3_drl_ws/src/tb3_drl_nav/models/empty_tx-sac_hybrid_la-velocity_clearance_seed45_MC3_C1_final/vecnormalize.pkl",
+    "seed": 45,
+    "tau": 0.005,
+    "total_timesteps": 150000
+  }
+}

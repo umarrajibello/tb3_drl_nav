@@ -3,7 +3,7 @@ import numpy as np
 # Simulation
 GUI = True       # default, overridden by command line
 TIME_STEP = 1./240.
-MAX_STEPS = 1000
+MAX_STEPS = 5000
 # Environment type (will be overridden by command line)
 ENV_TYPE = 'static'   # default, can be 'static', 'mixed', or 'dense'
 
@@ -21,6 +21,9 @@ LIDAR_OFFSET = 0.20
 # Goal & Reward
 GOAL_THRESHOLD = 0.2
 COLLISION_DIST = 0.15
+# Goal-distance curriculum
+GOAL_DIST_MIN = 1.0
+GOAL_DIST_MAX = 2.0
 
 #STATIC_OBSTACLES = [ (-1.2, 0.8), (-1.5, -0.5), (0.5, -1.2)
                    # ]  #No obstacles for now.
@@ -38,7 +41,7 @@ DYNAMIC_CONFIG = {
 
 # Global planner (RRT)
 PLANNER_TYPE = 'rrt'
-PLANNER_UPDATE_FREQ = 10      # steps between replans
+PLANNER_UPDATE_FREQ = 50      # steps between replans
 WAYPOINT_DISTANCE = 1.0       # meters ahead on the path
 
 # Temporal observation (for LSTM and Transformer)

@@ -1,0 +1,983 @@
+"""
+Base TurtleBot3 navigation environment.
+
+This file contains only the base Gymnasium/PyBullet environment.
+The proposed RRT-guided hybrid method is implemented separately in
+``env/tb3_env_hybrid.py`` as a subclass of ``TB3Env``.
+"""
+
+import random
+import time
+
+import gymnasium as gym
+import numpy as np
+import pybullet as p
+import pybullet_data
+from gymnasium import spaces
+
+from config import (
+    TIME_STEP,
+    MAX_STEPS,
+    NUM_LIDAR,
+    LIDAR_RANGE,
+    LIDAR_OFFSET,
+    GOAL_THRESHOLD,
+    COLLISION_DIST,
+    LINEAR_VEL,
+    ANGULAR_VEL,
+    WHEEL_RADIUS,
+    WHEEL_BASE,
+    STATIC_OBSTACLES,
+    DYNAMIC_CONFIG,
+    ENV_TYPE,
+)
+
+from env.reward import RewardCalculator
+
+
+class TB3Env(gym.Env):
+    """Base TurtleBot3 environment used by E2E and hybrid variants."""
+
+    metadata = {"render_modes": ["human", None]}
+
+    def __init__(self, render_mode=None, env_type=None, gui=None):
+        super().__init__()
+
+        self.render_mode = render_mode
+        self.env_type = ENV_TYPE if env_type is None else env_type
+
+        # GUI is controlled explicitly by the caller when provided.
+        # Otherwise, render_mode="human" means GUI and render_mode=None
+        # means headless DIRECT mode.
+        if gui is None:
+            gui = render_mode == "human"
+
+        self.gui = bool(gui)
+
+        # Expose configuration values as instance attributes because the
+        # hybrid subclass uses these attributes directly.
+        self.TIME_STEP = TIME_STEP
+        self.MAX_STEPS = MAX_STEPS
+        self.LIDAR_RANGE = LIDAR_RANGE
+        self.COLLISION_DIST = COLLISION_DIST
+        self.GOAL_THRESHOLD = GOAL_THRESHOLD
+        self.WHEEL_RADIUS = WHEEL_RADIUS
+        self.WHEEL_BASE = WHEEL_BASE
+        self.LINEAR_VEL = LINEAR_VEL
+        self.ANGULAR_VEL = ANGULAR_VEL
+
+        # Each environment owns its own PyBullet client.
+        self.client = p.connect(
+            p.GUI if self.gui else p.DIRECT
+        )
+
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+
+        self.robot_id = None
+        self.left_wheel = None
+        self.right_wheel = None
+        self.goal_id = None
+
+        self.static_obstacles = []
+        self.dynamic_obstacles = []
+
+        self.world_bounds = [-3.0, 3.0, -3.0, 3.0]
+
+        self.step_count = 0
+        self.prev_dist_to_goal = None
+
+        self.goal_pos = np.array(
+            [1.5, 1.5, 0.0],
+            dtype=np.float32,
+        )
+
+        self.reward_calc = RewardCalculator()
+
+        # Observation:
+        #   NUM_LIDAR = 36
+        #   linear velocity = 1
+        #   angular velocity = 1
+        #   goal dx, dy, distance = 3
+        #
+        # Total = 41 dimensions.
+        self.obs_dim = NUM_LIDAR + 2 + 3
+
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.obs_dim,),
+            dtype=np.float32,
+        )
+
+        # Action:
+        #   normalized linear velocity command
+        #   normalized angular velocity command
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(2,),
+            dtype=np.float32,
+        )
+
+        self._load_world()
+        self._load_robot()
+        self._place_goal()
+        self._spawn_static_obstacles()
+        self._init_dynamic_obstacles()
+
+    # ------------------------------------------------------------------
+    # World setup
+    # ------------------------------------------------------------------
+
+    def _load_world(self):
+        """Reset and configure the PyBullet simulation."""
+
+        p.resetSimulation(
+            physicsClientId=self.client
+        )
+
+        # resetSimulation destroys every body in the client.
+        # Therefore all previously stored body IDs are now invalid.
+        self.robot_id = None
+        self.left_wheel = None
+        self.right_wheel = None
+        self.goal_id = None
+        self.static_obstacles = []
+        self.dynamic_obstacles = []
+
+        p.setRealTimeSimulation(
+            0,
+            physicsClientId=self.client,
+        )
+
+        p.setPhysicsEngineParameter(
+            fixedTimeStep=TIME_STEP,
+            numSubSteps=1,
+            numSolverIterations=10,
+            physicsClientId=self.client,
+        )
+
+        p.setGravity(
+            0,
+            0,
+            -9.8,
+            physicsClientId=self.client,
+        )
+
+        p.loadURDF(
+            "plane.urdf",
+            physicsClientId=self.client,
+        )
+
+    def _load_robot(self):
+        """Load TurtleBot3 Burger and identify wheel joints."""
+
+        self.robot_id = p.loadURDF(
+            "assets/turtlebot3/turtlebot3_description/urdf/turtlebot3_burger.urdf",
+            [0.0, 0.0, 0.0],
+            [0, 0, 0, 1],
+            physicsClientId=self.client,
+        )
+
+        self.left_wheel = None
+        self.right_wheel = None
+
+        for i in range(
+            p.getNumJoints(
+                self.robot_id,
+                physicsClientId=self.client,
+            )
+        ):
+            name = p.getJointInfo(
+                self.robot_id,
+                i,
+                physicsClientId=self.client,
+            )[1].decode()
+
+            if "wheel_left" in name:
+                self.left_wheel = i
+
+            elif "wheel_right" in name:
+                self.right_wheel = i
+
+        if self.left_wheel is None or self.right_wheel is None:
+            raise RuntimeError(
+                "Could not identify TurtleBot3 wheel joints."
+            )
+
+    def _place_goal(self):
+        """Create the visual goal marker."""
+
+        # This method can also be called without resetSimulation().
+        # In that case, remove the existing goal if it is still valid.
+        if self.goal_id is not None:
+            try:
+                p.removeBody(
+                    self.goal_id,
+                    physicsClientId=self.client,
+                )
+            except Exception:
+                pass
+
+        vis = p.createVisualShape(
+            p.GEOM_SPHERE,
+            radius=0.10,
+            rgbaColor=[0, 1, 0, 1],
+            physicsClientId=self.client,
+        )
+
+        self.goal_id = p.createMultiBody(
+            baseMass=0,
+            baseVisualShapeIndex=vis,
+            basePosition=self.goal_pos.tolist(),
+            physicsClientId=self.client,
+        )
+
+    @staticmethod
+    def _point_clear_of_static_obstacles(
+        x,
+        y,
+        margin=0.45,
+    ):
+        """Check whether a point is sufficiently far from static obstacles."""
+
+        return all(
+            np.hypot(
+                float(x) - ox,
+                float(y) - oy,
+            ) >= margin
+            for ox, oy in STATIC_OBSTACLES
+        )
+
+    def _spawn_static_obstacles(self):
+        """Create the static obstacle field."""
+
+        self.static_obstacles = []
+
+        box_collision = p.createCollisionShape(
+            p.GEOM_BOX,
+            halfExtents=[0.2, 0.2, 0.1],
+            physicsClientId=self.client,
+        )
+
+        box_visual = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[0.2, 0.2, 0.1],
+            rgbaColor=[1, 0, 0, 1],
+            physicsClientId=self.client,
+        )
+
+        seen = set()
+
+        for x, y in STATIC_OBSTACLES:
+            key = (
+                round(float(x), 6),
+                round(float(y), 6),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            body = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=box_collision,
+                baseVisualShapeIndex=box_visual,
+                basePosition=[x, y, 0.1],
+                physicsClientId=self.client,
+            )
+
+            self.static_obstacles.append(body)
+
+    def _position_is_free(
+        self,
+        x,
+        y,
+        min_distance=0.55,
+    ):
+        """Check whether a point is free of relevant objects."""
+
+        if not self._point_clear_of_static_obstacles(
+            x,
+            y,
+            margin=min_distance,
+        ):
+            return False
+
+        if (
+            np.hypot(
+                x - self.goal_pos[0],
+                y - self.goal_pos[1],
+            )
+            < min_distance
+        ):
+            return False
+
+        try:
+            robot_xy = self._get_robot_pose()[:2]
+
+            if (
+                np.hypot(
+                    x - robot_xy[0],
+                    y - robot_xy[1],
+                )
+                < min_distance
+            ):
+                return False
+
+        except Exception:
+            pass
+
+        for obs in self.dynamic_obstacles:
+            ox, oy = obs["pos"][:2]
+
+            if (
+                np.hypot(
+                    x - ox,
+                    y - oy,
+                )
+                < min_distance
+            ):
+                return False
+
+        return True
+
+    def _init_dynamic_obstacles(self):
+        """Create dynamic obstacles according to the environment type."""
+
+        self.dynamic_obstacles = []
+
+        cfg = DYNAMIC_CONFIG.get(
+            self.env_type,
+            {"num": 0},
+        )
+
+        num = int(cfg.get("num", 0))
+        speed = float(cfg.get("speed", 0.2))
+
+        xmin, xmax, ymin, ymax = map(
+            float,
+            cfg.get(
+                "bounds",
+                [-3, 3, -3, 3],
+            ),
+        )
+
+        for _ in range(num):
+            position = None
+
+            for _attempt in range(200):
+                x = random.uniform(
+                    xmin + 0.2,
+                    xmax - 0.2,
+                )
+
+                y = random.uniform(
+                    ymin + 0.2,
+                    ymax - 0.2,
+                )
+
+                if self._position_is_free(x, y):
+                    position = [
+                        x,
+                        y,
+                        0.1,
+                    ]
+                    break
+
+            if position is None:
+                continue
+
+            vx = random.uniform(
+                -speed,
+                speed,
+            )
+
+            vy = random.uniform(
+                -speed,
+                speed,
+            )
+
+            if speed > 0 and abs(vx) + abs(vy) < 1e-6:
+                vx = speed
+
+            col = p.createCollisionShape(
+                p.GEOM_SPHERE,
+                radius=0.1,
+                physicsClientId=self.client,
+            )
+
+            vis = p.createVisualShape(
+                p.GEOM_SPHERE,
+                radius=0.1,
+                rgbaColor=[0, 0, 1, 1],
+                physicsClientId=self.client,
+            )
+
+            body = p.createMultiBody(
+                baseMass=1,
+                baseCollisionShapeIndex=col,
+                baseVisualShapeIndex=vis,
+                basePosition=position,
+                physicsClientId=self.client,
+            )
+
+            self.dynamic_obstacles.append(
+                {
+                    "id": body,
+                    "pos": list(position),
+                    "vel": [vx, vy, 0.0],
+                }
+            )
+
+    def _update_dynamic_obstacles(self):
+        """Move dynamic obstacles and bounce them at environment bounds."""
+
+        cfg = DYNAMIC_CONFIG.get(
+            self.env_type,
+            {"num": 0},
+        )
+
+        xmin, xmax, ymin, ymax = map(
+            float,
+            cfg.get(
+                "bounds",
+                [-3, 3, -3, 3],
+            ),
+        )
+
+        for obs in self.dynamic_obstacles:
+            obs["pos"][0] += obs["vel"][0] * TIME_STEP
+            obs["pos"][1] += obs["vel"][1] * TIME_STEP
+
+            if (
+                obs["pos"][0] < xmin
+                or obs["pos"][0] > xmax
+            ):
+                obs["vel"][0] *= -1.0
+                obs["pos"][0] = np.clip(
+                    obs["pos"][0],
+                    xmin,
+                    xmax,
+                )
+
+            if (
+                obs["pos"][1] < ymin
+                or obs["pos"][1] > ymax
+            ):
+                obs["vel"][1] *= -1.0
+                obs["pos"][1] = np.clip(
+                    obs["pos"][1],
+                    ymin,
+                    ymax,
+                )
+
+            p.resetBasePositionAndOrientation(
+                obs["id"],
+                obs["pos"],
+                [0, 0, 0, 1],
+                physicsClientId=self.client,
+            )
+
+            p.resetBaseVelocity(
+                obs["id"],
+                linearVelocity=obs["vel"],
+                angularVelocity=[0, 0, 0],
+                physicsClientId=self.client,
+            )
+
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
+
+    def reset(
+        self,
+        *,
+        seed=None,
+        options=None,
+    ):
+        """Reset the environment and return (observation, info)."""
+
+        super().reset(seed=seed)
+
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+
+        self.step_count = 0
+        self.prev_dist_to_goal = None
+
+        self._load_world()
+        self._load_robot()
+
+        # Randomize goal.
+        for _ in range(200):
+            gx = random.uniform(-2.5, 2.5)
+            gy = random.uniform(-2.5, 2.5)
+
+            if (
+                np.hypot(gx, gy) > 0.8
+                and self._point_clear_of_static_obstacles(
+                    gx,
+                    gy,
+                )
+            ):
+                self.goal_pos = np.array(
+                    [gx, gy, 0.0],
+                    dtype=np.float32,
+                )
+                break
+
+        else:
+            self.goal_pos = np.array(
+                [1.5, 1.5, 0.0],
+                dtype=np.float32,
+            )
+
+        self._place_goal()
+        self._spawn_static_obstacles()
+
+        # Randomize robot starting pose.
+        for _ in range(200):
+            x = random.uniform(-0.5, 0.5)
+            y = random.uniform(-0.5, 0.5)
+
+            if (
+                self._point_clear_of_static_obstacles(
+                    x,
+                    y,
+                    margin=0.45,
+                )
+                and np.hypot(
+                    x - self.goal_pos[0],
+                    y - self.goal_pos[1],
+                ) > 0.8
+            ):
+                yaw = random.uniform(
+                    -np.pi,
+                    np.pi,
+                )
+                break
+
+        else:
+            x, y, yaw = 0.0, 0.0, 0.0
+
+        p.resetBasePositionAndOrientation(
+            self.robot_id,
+            [x, y, 0.0],
+            p.getQuaternionFromEuler(
+                [0, 0, yaw]
+            ),
+            physicsClientId=self.client,
+        )
+
+        self._init_dynamic_obstacles()
+
+        # Let the physics state settle.
+        for _ in range(20):
+            p.stepSimulation(
+                physicsClientId=self.client
+            )
+
+            if self.gui:
+                time.sleep(TIME_STEP)
+
+        self.prev_dist_to_goal = self._distance_to_goal()
+
+        reset_reward = getattr(
+            self.reward_calc,
+            "reset_step_count",
+            None,
+        )
+
+        if callable(reset_reward):
+            reset_reward()
+
+        obs = self._get_observation()
+
+        info = {
+            "env_type": self.env_type,
+            "distance_to_goal": float(
+                self.prev_dist_to_goal
+            ),
+        }
+
+        return obs, info
+
+    def step(self, action):
+        """Execute one RL action."""
+
+        self.step_count += 1
+
+        action = np.clip(
+            np.asarray(
+                action,
+                dtype=np.float32,
+            ),
+            -1.0,
+            1.0,
+        )
+
+        linear = (
+            float(action[0])
+            * LINEAR_VEL
+        )
+
+        angular = (
+            float(action[1])
+            * ANGULAR_VEL
+        )
+
+        left = (
+            linear
+            - (WHEEL_BASE / 2.0) * angular
+        ) / WHEEL_RADIUS
+
+        right = (
+            linear
+            + (WHEEL_BASE / 2.0) * angular
+        ) / WHEEL_RADIUS
+
+        p.setJointMotorControl2(
+            self.robot_id,
+            self.left_wheel,
+            p.VELOCITY_CONTROL,
+            targetVelocity=left,
+            force=2.0,
+            physicsClientId=self.client,
+        )
+
+        p.setJointMotorControl2(
+            self.robot_id,
+            self.right_wheel,
+            p.VELOCITY_CONTROL,
+            targetVelocity=right,
+            force=2.0,
+            physicsClientId=self.client,
+        )
+
+        # One RL action corresponds to 8 physics steps.
+        for _ in range(8):
+            p.stepSimulation(
+                physicsClientId=self.client
+            )
+
+            self._update_dynamic_obstacles()
+
+            if self.gui:
+                time.sleep(TIME_STEP)
+
+        # --------------------------------------------------------------
+        # Evaluate the new state.
+        # --------------------------------------------------------------
+
+        robot_pose = self._get_robot_pose()
+        lidar = self._get_lidar()
+
+        # Capture transition-level physical velocity BEFORE any VecEnv
+        # terminal auto-reset can replace the simulator state.
+        transition_linear_velocity, transition_angular_velocity = (
+            self._get_robot_velocity()
+        )
+
+        collision = bool(
+            self._check_collision()
+        )
+
+        reached_goal = bool(
+            self._check_goal()
+        )
+
+        curr_dist = self._distance_to_goal()
+
+        if self.prev_dist_to_goal is None:
+            self.prev_dist_to_goal = curr_dist
+
+        # --------------------------------------------------------------
+        # Reward API
+        #
+        # TB3Env's local target is the global goal.
+        # The reward calculator uses generic waypoint terminology so that
+        # the same reward implementation can also be used by the hybrid
+        # environment, whose local target is an RRT waypoint.
+        # --------------------------------------------------------------
+
+        reward, done = self.reward_calc.compute(
+            prev_wp_dist=self.prev_dist_to_goal,
+            curr_wp_dist=curr_dist,
+            robot_pose=robot_pose,
+            collision=collision,
+            reached_goal=reached_goal,
+            action=action,
+            lidar_scan=lidar,
+            goal_xy=self.goal_pos[:2],
+        )
+
+        # Update previous target distance only after computing progress.
+        self.prev_dist_to_goal = curr_dist
+
+        # Out-of-bounds is a termination condition.
+        #
+        # It is deliberately NOT given an additional reward penalty here.
+        # The reward therefore remains exactly the four components defined
+        # by RewardCalculator:
+        # progress + clearance + time + terminal outcome.
+        xmin, xmax, ymin, ymax = self.world_bounds
+
+        out_of_bounds = not (
+            xmin <= robot_pose[0] <= xmax
+            and ymin <= robot_pose[1] <= ymax
+        )
+
+        if out_of_bounds:
+            done = True
+
+        terminated = bool(done)
+
+        truncated = bool(
+            self.step_count >= MAX_STEPS
+            and not terminated
+        )
+
+        info = {
+            "collision": collision,
+            "reached_goal": reached_goal,
+            # Exact physical state belonging to this transition.
+            # These fields are diagnostic instrumentation only.
+            "transition_linear_velocity": float(
+                transition_linear_velocity
+            ),
+            "transition_angular_velocity": float(
+                transition_angular_velocity
+            ),
+            "transition_robot_x": float(robot_pose[0]),
+            "transition_robot_y": float(robot_pose[1]),
+            "transition_robot_yaw": float(robot_pose[2]),
+            "safety_violation": bool(
+                np.min(lidar) * LIDAR_RANGE
+                < COLLISION_DIST
+            ),
+            "distance_to_goal": float(
+                curr_dist
+            ),
+            "out_of_bounds": bool(
+                out_of_bounds
+            ),
+        }
+
+        return (
+            self._get_observation(),
+            float(reward),
+            terminated,
+            truncated,
+            info,
+        )
+
+    # ------------------------------------------------------------------
+    # State / observation helpers
+    # ------------------------------------------------------------------
+
+    def _get_observation(self):
+        """Return the 41-dimensional base observation."""
+
+        lidar = self._get_lidar()
+        v, w = self._get_robot_velocity()
+        pose = self._get_robot_pose()
+
+        dx = self.goal_pos[0] - pose[0]
+        dy = self.goal_pos[1] - pose[1]
+
+        c = np.cos(pose[2])
+        s = np.sin(pose[2])
+
+        dx_robot = c * dx + s * dy
+        dy_robot = -s * dx + c * dy
+
+        dist = np.hypot(dx_robot, dy_robot)
+
+
+        return np.concatenate(
+            [
+                lidar,
+                np.array(
+                    [v, w],
+                    dtype=np.float32,
+                ),
+                np.array(
+                    [dx_robot, dy_robot, dist],
+                    dtype=np.float32,
+                ),
+            ]
+        ).astype(np.float32)
+
+    def _get_lidar(self):
+        from env.lidar import get_lidar_scan
+
+        return get_lidar_scan(
+            self.robot_id,
+            NUM_LIDAR,
+            LIDAR_RANGE,
+            LIDAR_OFFSET,
+        ).astype(np.float32)
+
+    def _get_robot_pose(self):
+        pos, ori = p.getBasePositionAndOrientation(
+            self.robot_id,
+            physicsClientId=self.client,
+        )
+
+        _, _, yaw = p.getEulerFromQuaternion(ori)
+
+        return np.array(
+            [
+                pos[0],
+                pos[1],
+                yaw,
+            ],
+            dtype=np.float32,
+        )
+
+    def _get_robot_velocity(self):
+        lin, ang = p.getBaseVelocity(
+            self.robot_id,
+            physicsClientId=self.client,
+        )
+
+        yaw = float(
+            self._get_robot_pose()[2]
+        )
+
+        # Forward velocity in the robot body frame.
+        v = (
+            np.cos(yaw) * float(lin[0])
+            + np.sin(yaw) * float(lin[1])
+        )
+
+        return float(v), float(ang[2])
+
+    def _distance_to_goal(self):
+        pose = self._get_robot_pose()
+
+        return float(
+            np.hypot(
+                self.goal_pos[0] - pose[0],
+                self.goal_pos[1] - pose[1],
+            )
+        )
+
+    def _check_collision(self):
+        """
+        Check physical contact with navigation obstacles.
+
+        The robot is expected to be in contact with the ground plane,
+        so generic PyBullet contact detection must NOT classify every
+        contact as a collision.
+
+        Only contacts with explicitly tracked static or dynamic
+        obstacles count as collisions.
+        """
+
+        collision_body_ids = set(
+            self.static_obstacles
+        )
+
+        collision_body_ids.update(
+            obs["id"]
+            for obs in self.dynamic_obstacles
+        )
+
+        if not collision_body_ids:
+            return False
+
+        for contact in p.getContactPoints(
+            bodyA=self.robot_id,
+            physicsClientId=self.client,
+        ):
+            other = contact[2]
+
+            if other in collision_body_ids:
+                return True
+
+        return False
+
+    def _check_goal(self):
+        return (
+            self._distance_to_goal()
+            < GOAL_THRESHOLD
+        )
+
+    # ------------------------------------------------------------------
+    # Public compatibility helpers
+    # ------------------------------------------------------------------
+
+    def get_robot_pose(self):
+        return self._get_robot_pose()
+
+    def get_robot_velocity(self):
+        return self._get_robot_velocity()
+
+    def get_lidar(self):
+        return self._get_lidar()
+
+    def get_dynamic_obstacle_distances(self):
+        robot_xy = self.get_robot_pose()[:2]
+
+        return [
+            float(
+                np.hypot(
+                    robot_xy[0] - obs["pos"][0],
+                    robot_xy[1] - obs["pos"][1],
+                )
+            )
+            for obs in self.dynamic_obstacles
+        ]
+
+    def get_robot_position(self):
+        return self.get_robot_pose()[:2]
+
+    def get_obs(self):
+        return self.get_lidar()
+
+    def draw_path(self, path, color=None):
+        if path is None or len(path) < 2:
+            return
+
+        color = (
+            [0, 1, 0]
+            if color is None
+            else color
+        )
+
+        for i in range(len(path) - 1):
+            p.addUserDebugLine(
+                [
+                    float(path[i][0]),
+                    float(path[i][1]),
+                    0.05,
+                ],
+                [
+                    float(path[i + 1][0]),
+                    float(path[i + 1][1]),
+                    0.05,
+                ],
+                lineColorRGB=color,
+                lineWidth=2.0,
+                physicsClientId=self.client,
+            )
+
+    def close(self):
+        """Release this environment's PyBullet client."""
+
+        if (
+            getattr(self, "client", None)
+            is not None
+        ):
+            try:
+                p.disconnect(
+                    physicsClientId=self.client
+                )
+            except Exception:
+                pass
+
+            self.client = None

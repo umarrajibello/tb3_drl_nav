@@ -1,0 +1,748 @@
+"Name","State","Notes","User","Tags","Created","Runtime","Sweep","_current_progress_remaining","_custom_logger","_episode_num","_episode_storage","_last_episode_starts","_last_obs","_last_original_obs","_logger","_n_updates","_num_timesteps_at_start","_stats_window_size","_total_timesteps","_vec_normalize_env","action_noise","action_space","actor","algo","algorithm","away_penalty","batch_norm_stats","batch_norm_stats_target","batch_size","buffer_size","collision_penalty","critic","critic_target","device","ent_coef","ent_coef_optimizer","ent_coef_tensor","env","env_type","ep_info_buffer","ep_success_buffer","eval_freq","exp_suffix","gamma","git_commit","goal_reward","gradient_steps","hybrid","learning_rate","learning_starts","log_ent_coef","lr_schedule","n_envs","num_envs","num_timesteps","observation_space","optimize_memory_usage","policy","policy_class","policy_kwargs","pretrained","progress_weight","python_version","replay_buffer","replay_buffer_class","replay_buffer_kwargs","sde_sample_freq","seed","start_time","target_entropy","target_update_interval","tau","tensorboard_log","torch_version","total_timesteps","train_freq","use_gpu","use_sde","use_sde_at_warmup","verbose","eval/mean_ep_length","eval/mean_reward","final_model_path","global_step","time/fps","train/actor_loss","train/critic_loss","train/ent_coef","train/learning_rate"
+"dense","finished","-","","","2026-05-12T23:35:25.000Z","5609","","1","False","0","None","[ True  True  True  True  True  True  True  True  True  True  True  True]","[[ 0.44266346  0.6922812   0.55590475 ...  1.702643   -1.4708796
+   0.6882104 ]
+ [ 0.44266346  0.6922812  -2.0416589  ... -0.66896677  0.7147695
+   0.7197861 ]
+ [ 0.44266346  0.6922812   0.55590475 ... -0.7305035   0.6445068
+   0.46214485]
+ ...
+ [ 0.44266346  0.6922812   0.55590475 ...  1.980905   -1.2617762
+  -0.03848547]
+ [ 0.44266346  0.6922812   0.55590475 ... -0.2785534  -1.2854726
+  -2.3042245 ]
+ [-2.5610018  -1.8176908   0.55590475 ... -0.49570832  0.7819771
+   0.03994447]]","[[ 1.          1.          1.         ...  0.20985585 -0.33982125
+   0.39939702]
+ [ 1.          1.          0.29520327 ... -0.28598472  0.2795099
+   0.3998913 ]
+ [ 1.          1.          1.         ... -0.29885042  0.2596001
+   0.3958583 ]
+ ...
+ [ 1.          1.          1.         ...  0.26803306 -0.2805692
+   0.38802165]
+ [ 1.          1.          1.         ... -0.20435967 -0.28728387
+   0.3525548 ]
+ [ 0.20072795  0.2118192   1.         ... -0.24976099  0.29855403
+   0.38924935]]","<stable_baselines3.common.logger.Logger object at 0x799d2b3171f0>","0","0","100","200000","<stable_baselines3.common.vec_env.vec_normalize.VecNormalize object at 0x799a7fb5fd90>","None","Box(-1.0, 1.0, (2,), float32)","Actor(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (latent_pi): Sequential(
+    (0): Linear(in_features=256, out_features=256, bias=True)
+    (1): ReLU()
+  )
+  (mu): Linear(in_features=256, out_features=2, bias=True)
+  (log_std): Linear(in_features=256, out_features=2, bias=True)
+)","SAC","tx-sac","3","[]","[]","256","800000","150","ContinuousCritic(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (qf0): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+  (qf1): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+)","ContinuousCritic(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (qf0): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+  (qf1): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+)","cuda","0.1","None","tensor(0.1000, device='cuda:0')","<stable_baselines3.common.vec_env.vec_normalize.VecNormalize object at 0x799a7fb5fd90>","static","deque([], maxlen=100)","deque([], maxlen=100)","10000","","0.99","fe7759ec","500","1","true","0.00005","100","None","<function get_schedule_fn.<locals>.<lambda> at 0x799a7fbdb880>","12","12","0","Box(0.0, 1.0, (328,), float32)","False","SACPolicy(
+  (actor): Actor(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (latent_pi): Sequential(
+      (0): Linear(in_features=256, out_features=256, bias=True)
+      (1): ReLU()
+    )
+    (mu): Linear(in_features=256, out_features=2, bias=True)
+    (log_std): Linear(in_features=256, out_features=2, bias=True)
+  )
+  (critic): ContinuousCritic(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (qf0): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+    (qf1): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+  )
+  (critic_target): ContinuousCritic(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (qf0): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+    (qf1): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+  )
+)","<class 'stable_baselines3.sac.policies.SACPolicy'>","{'features_extractor_class': <class 'policies.transformer_extractor.SB3_Transformer_Extractor'>, 'features_extractor_kwargs': {'features_dim': 256}, 'net_arch': {'pi': [256], 'qf': [256]}, 'use_sde': False}","false","2","3.10.20 (main, Mar 11 2026, 17:46:40) [GCC 14.3.0]","<stable_baselines3.common.buffers.ReplayBuffer object at 0x799a7fbcb070>","<class 'stable_baselines3.common.buffers.ReplayBuffer'>","{}","-1","42","1778628931794941000","-2","1","0.005","./tb_logs/static_tx-sac_hybrid_seed42_","2.3.1+cu121","200000","TrainFreq(frequency=1, unit=<TrainFrequencyUnit.STEP: 'step'>)","true","False","False","1","200","-220.14963","./models/static_tx-sac_hybrid_seed42__final","199200","35","68.5327","7.439158","0.1","0.00005"
+"shaped","finished","-","","","2026-05-12T23:33:51.000Z","6232","","1","False","0","None","[ True  True  True  True  True  True  True  True  True  True  True  True]","[[ 0.44266346  0.6922812   0.55590475 ...  1.702643   -1.4708796
+   0.6882104 ]
+ [ 0.44266346  0.6922812  -2.0416589  ... -0.66896677  0.7147695
+   0.7197861 ]
+ [ 0.44266346  0.6922812   0.55590475 ... -0.7305035   0.6445068
+   0.46214485]
+ ...
+ [ 0.44266346  0.6922812   0.55590475 ...  1.980905   -1.2617762
+  -0.03848547]
+ [ 0.44266346  0.6922812   0.55590475 ... -0.2785534  -1.2854726
+  -2.3042245 ]
+ [-2.5610018  -1.8176908   0.55590475 ... -0.49570832  0.7819771
+   0.03994447]]","[[ 1.          1.          1.         ...  0.20985585 -0.33982125
+   0.39939702]
+ [ 1.          1.          0.29520327 ... -0.28598472  0.2795099
+   0.3998913 ]
+ [ 1.          1.          1.         ... -0.29885042  0.2596001
+   0.3958583 ]
+ ...
+ [ 1.          1.          1.         ...  0.26803306 -0.2805692
+   0.38802165]
+ [ 1.          1.          1.         ... -0.20435967 -0.28728387
+   0.3525548 ]
+ [ 0.20072795  0.2118192   1.         ... -0.24976099  0.29855403
+   0.38924935]]","<stable_baselines3.common.logger.Logger object at 0x7c6887306560>","0","0","100","200000","<stable_baselines3.common.vec_env.vec_normalize.VecNormalize object at 0x7c661f35ff70>","None","Box(-1.0, 1.0, (2,), float32)","Actor(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (latent_pi): Sequential(
+    (0): Linear(in_features=256, out_features=256, bias=True)
+    (1): ReLU()
+  )
+  (mu): Linear(in_features=256, out_features=2, bias=True)
+  (log_std): Linear(in_features=256, out_features=2, bias=True)
+)","SAC","tx-sac","3","[]","[]","256","800000","150","ContinuousCritic(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (qf0): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+  (qf1): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+)","ContinuousCritic(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (qf0): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+  (qf1): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+)","cuda","0.1","None","tensor(0.1000, device='cuda:0')","<stable_baselines3.common.vec_env.vec_normalize.VecNormalize object at 0x7c661f35ff70>","static","deque([], maxlen=100)","deque([], maxlen=100)","10000","","0.99","fe7759ec","500","1","true","0.00005","100","None","<function get_schedule_fn.<locals>.<lambda> at 0x7c661f3d6f80>","12","12","0","Box(0.0, 1.0, (328,), float32)","False","SACPolicy(
+  (actor): Actor(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (latent_pi): Sequential(
+      (0): Linear(in_features=256, out_features=256, bias=True)
+      (1): ReLU()
+    )
+    (mu): Linear(in_features=256, out_features=2, bias=True)
+    (log_std): Linear(in_features=256, out_features=2, bias=True)
+  )
+  (critic): ContinuousCritic(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (qf0): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+    (qf1): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+  )
+  (critic_target): ContinuousCritic(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (qf0): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+    (qf1): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+  )
+)","<class 'stable_baselines3.sac.policies.SACPolicy'>","{'features_extractor_class': <class 'policies.transformer_extractor.SB3_Transformer_Extractor'>, 'features_extractor_kwargs': {'features_dim': 256}, 'net_arch': {'pi': [256], 'qf': [256]}, 'use_sde': False}","false","2","3.10.20 (main, Mar 11 2026, 17:46:40) [GCC 14.3.0]","<stable_baselines3.common.buffers.ReplayBuffer object at 0x7c661f3c7130>","<class 'stable_baselines3.common.buffers.ReplayBuffer'>","{}","-1","42","1778628837012332800","-2","1","0.005","./tb_logs/static_tx-sac_hybrid_seed42_","2.3.1+cu121","200000","TrainFreq(frequency=1, unit=<TrainFrequencyUnit.STEP: 'step'>)","true","False","False","1","200","-207.22281","./models/static_tx-sac_hybrid_seed42__final","198984","32","63.49885","2.1049857","0.1","0.00005"
+"sparse","finished","-","","","2026-05-12T23:32:18.000Z","6018","","1","False","0","None","[ True  True  True  True  True  True  True  True  True  True  True  True]","[[ 0.44266346  0.6922812   0.55590475 ...  1.702643   -1.4708796
+   0.6882104 ]
+ [ 0.44266346  0.6922812  -2.0416589  ... -0.66896677  0.7147695
+   0.7197861 ]
+ [ 0.44266346  0.6922812   0.55590475 ... -0.7305035   0.6445068
+   0.46214485]
+ ...
+ [ 0.44266346  0.6922812   0.55590475 ...  1.980905   -1.2617762
+  -0.03848547]
+ [ 0.44266346  0.6922812   0.55590475 ... -0.2785534  -1.2854726
+  -2.3042245 ]
+ [-2.5610018  -1.8176908   0.55590475 ... -0.49570832  0.7819771
+   0.03994447]]","[[ 1.          1.          1.         ...  0.20985585 -0.33982125
+   0.39939702]
+ [ 1.          1.          0.29520327 ... -0.28598472  0.2795099
+   0.3998913 ]
+ [ 1.          1.          1.         ... -0.29885042  0.2596001
+   0.3958583 ]
+ ...
+ [ 1.          1.          1.         ...  0.26803306 -0.2805692
+   0.38802165]
+ [ 1.          1.          1.         ... -0.20435967 -0.28728387
+   0.3525548 ]
+ [ 0.20072795  0.2118192   1.         ... -0.24976099  0.29855403
+   0.38924935]]","<stable_baselines3.common.logger.Logger object at 0x7f5a19319f00>","0","0","100","200000","<stable_baselines3.common.vec_env.vec_normalize.VecNormalize object at 0x7f5765563d90>","None","Box(-1.0, 1.0, (2,), float32)","Actor(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (latent_pi): Sequential(
+    (0): Linear(in_features=256, out_features=256, bias=True)
+    (1): ReLU()
+  )
+  (mu): Linear(in_features=256, out_features=2, bias=True)
+  (log_std): Linear(in_features=256, out_features=2, bias=True)
+)","SAC","tx-sac","3","[]","[]","256","800000","150","ContinuousCritic(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (qf0): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+  (qf1): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+)","ContinuousCritic(
+  (features_extractor): SB3_Transformer_Extractor(
+    (cnn): Sequential(
+      (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+      (1): ReLU()
+      (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+      (3): ReLU()
+      (4): Flatten(start_dim=1, end_dim=-1)
+    )
+    (proj): Linear(in_features=1157, out_features=64, bias=True)
+    (transformer): TransformerEncoder(
+      (layers): ModuleList(
+        (0-1): 2 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+          )
+          (linear1): Linear(in_features=64, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=64, bias=True)
+          (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (fc): Linear(in_features=64, out_features=256, bias=True)
+  )
+  (qf0): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+  (qf1): Sequential(
+    (0): Linear(in_features=258, out_features=256, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=256, out_features=1, bias=True)
+  )
+)","cuda","0.1","None","tensor(0.1000, device='cuda:0')","<stable_baselines3.common.vec_env.vec_normalize.VecNormalize object at 0x7f5765563d90>","static","deque([], maxlen=100)","deque([], maxlen=100)","10000","","0.99","fe7759ec","500","1","true","0.00005","100","None","<function get_schedule_fn.<locals>.<lambda> at 0x7f57655df0a0>","12","12","0","Box(0.0, 1.0, (328,), float32)","False","SACPolicy(
+  (actor): Actor(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (latent_pi): Sequential(
+      (0): Linear(in_features=256, out_features=256, bias=True)
+      (1): ReLU()
+    )
+    (mu): Linear(in_features=256, out_features=2, bias=True)
+    (log_std): Linear(in_features=256, out_features=2, bias=True)
+  )
+  (critic): ContinuousCritic(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (qf0): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+    (qf1): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+  )
+  (critic_target): ContinuousCritic(
+    (features_extractor): SB3_Transformer_Extractor(
+      (cnn): Sequential(
+        (0): Conv1d(1, 16, kernel_size=(3,), stride=(1,), padding=(1,))
+        (1): ReLU()
+        (2): Conv1d(16, 32, kernel_size=(3,), stride=(1,), padding=(1,))
+        (3): ReLU()
+        (4): Flatten(start_dim=1, end_dim=-1)
+      )
+      (proj): Linear(in_features=1157, out_features=64, bias=True)
+      (transformer): TransformerEncoder(
+        (layers): ModuleList(
+          (0-1): 2 x TransformerEncoderLayer(
+            (self_attn): MultiheadAttention(
+              (out_proj): NonDynamicallyQuantizableLinear(in_features=64, out_features=64, bias=True)
+            )
+            (linear1): Linear(in_features=64, out_features=2048, bias=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+            (linear2): Linear(in_features=2048, out_features=64, bias=True)
+            (norm1): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (norm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+            (dropout1): Dropout(p=0.1, inplace=False)
+            (dropout2): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+      (fc): Linear(in_features=64, out_features=256, bias=True)
+    )
+    (qf0): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+    (qf1): Sequential(
+      (0): Linear(in_features=258, out_features=256, bias=True)
+      (1): ReLU()
+      (2): Linear(in_features=256, out_features=1, bias=True)
+    )
+  )
+)","<class 'stable_baselines3.sac.policies.SACPolicy'>","{'features_extractor_class': <class 'policies.transformer_extractor.SB3_Transformer_Extractor'>, 'features_extractor_kwargs': {'features_dim': 256}, 'net_arch': {'pi': [256], 'qf': [256]}, 'use_sde': False}","false","2","3.10.20 (main, Mar 11 2026, 17:46:40) [GCC 14.3.0]","<stable_baselines3.common.buffers.ReplayBuffer object at 0x7f57655cee60>","<class 'stable_baselines3.common.buffers.ReplayBuffer'>","{}","-1","42","1778628744291790300","-2","1","0.005","./tb_logs/static_tx-sac_hybrid_seed42_","2.3.1+cu121","200000","TrainFreq(frequency=1, unit=<TrainFrequencyUnit.STEP: 'step'>)","true","False","False","1","200","-211.1084","./models/static_tx-sac_hybrid_seed42__final","199200","33","68.00832","9.150616","0.1","0.00005"
