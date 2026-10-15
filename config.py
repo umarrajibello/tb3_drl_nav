@@ -3,7 +3,7 @@ import numpy as np
 # Simulation
 GUI = True       # default, overridden by command line
 TIME_STEP = 1./240.
-MAX_STEPS = 5000
+MAX_STEPS = 1000
 # Environment type (will be overridden by command line)
 ENV_TYPE = 'static'   # default, can be 'static', 'mixed', or 'dense'
 

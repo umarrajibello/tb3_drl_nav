@@ -197,7 +197,6 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         self.output_projection = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, features_dim),
-            nn.ReLU(),
         )
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
@@ -256,6 +255,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         temporal_features = self.transformer(timestep_features)
 
         # Fixed-size representation of the complete observation history.
-        pooled = temporal_features.mean(dim=1)
+        #pooled = temporal_features.mean(dim=1)
+        pooled = temporal_features[:, -1, :]
 
         return self.output_projection(pooled)

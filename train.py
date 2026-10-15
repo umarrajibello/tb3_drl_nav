@@ -57,6 +57,7 @@ from config import OBSERVATION_HISTORY
 from env.observation_wrapper import TemporalObservationWrapper
 from env.tb3_env import TB3Env
 from env.tb3_env_hybrid import TB3HybridEnv
+from callbacks.reward_logger import RewardComponentLogger
 
 
 TEMPORAL_ALGORITHMS = {
@@ -238,42 +239,65 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--alpha_floor",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum value for the SAC entropy coefficient when "
+            "ent_coef is 'auto_*'. Set to 0.0 to disable the floor. "
+            "Recommended: 0.01 or 0.05."
+        ),
+    )
+
     # --------------------------------------------------------
     # Reward parameters
     # --------------------------------------------------------
     parser.add_argument(
         "--goal_reward",
         type=float,
-        default=10.0,
+        default=100.0,
         help="Reward for reaching the goal",
     )
 
     parser.add_argument(
         "--collision_penalty",
         type=float,
-        default=10.0,
+        default=50.0,
         help="Penalty for physical collision",
     )
 
     parser.add_argument(
         "--progress_weight",
         type=float,
-        default=2.0,
+        default=10.0,
         help="Weight for progress toward local waypoint/goal",
     )
 
     parser.add_argument(
         "--clearance_weight",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Weight for near-obstacle clearance penalty",
     )
 
     parser.add_argument(
         "--step_penalty",
         type=float,
-        default=0.01,
+        default=0.001,
         help="Constant per-step penalty",
+    )
+    parser.add_argument(
+        "--safety_distance",
+        type=float,
+        default=0.05,
+        help="Normalized LiDAR clearance below which the penalty starts.",
+    )
+    parser.add_argument(
+        "--max_progress",
+        type=float,
+        default=0.20,
+        help="Clipping bound for per-step progress.",
     )
 
     # --------------------------------------------------------
@@ -291,6 +315,12 @@ def parse_args():
         type=int,
         default=None,
         help="Override batch size",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.99,
+        help="Discount factor (default 0.99).",
     )
 
     # --------------------------------------------------------
@@ -428,6 +458,8 @@ def configure_reward(env, args):
         "step_penalty": args.step_penalty,
         "success_reward": args.goal_reward,
         "collision_penalty": args.collision_penalty,
+        "safety_distance": args.safety_distance,
+        "max_progress": args.max_progress,
     }
 
     for name, value in attribute_map.items():
@@ -677,12 +709,13 @@ def build_experiment_metadata(
             "learning_rate": learning_rate,
             "batch_size": batch_size,
             "buffer_size": buffer_size,
-            "gamma": 0.99,
+            "gamma": args.gamma,
             "tau": 0.005,
             "ent_coef": ent_coef,
             "norm_reward": bool(args.norm_reward),
             "ent_coef_override": args.ent_coef,
             "grad_clip": args.grad_clip,
+            "alpha_floor": args.alpha_floor,
         },
 
         "reward": {
@@ -1252,7 +1285,7 @@ def main():
             buffer_size=buffer_size,
             batch_size=batch_size,
             tau=0.005,
-            gamma=0.99,
+            gamma=args.gamma,
             ent_coef=ent_coef,
             train_freq=1,
             gradient_steps=args.gradient_steps,
@@ -1262,7 +1295,7 @@ def main():
             seed=args.seed,
             **sac_kwargs,
         )
-
+ 
     elif args.algorithm == "ppo":
 
         model = PPO(
@@ -1285,7 +1318,7 @@ def main():
             device=device,
             seed=args.seed,
         )
-
+        
     else:
         sac_class = SAC
         sac_kwargs = {}
@@ -1297,6 +1330,13 @@ def main():
                 f"[Model] Gradient clipping enabled: "
                 f"max_grad_norm={args.grad_clip}"
             )
+        if args.alpha_floor > 0.0:
+            sac_kwargs["alpha_floor"] = args.alpha_floor
+            print(
+                f"[Model] Alpha floor enabled: "
+                f"alpha_floor={args.alpha_floor}"
+            )
+        
 
         model = sac_class(
             "MlpPolicy",
@@ -1305,7 +1345,7 @@ def main():
             buffer_size=buffer_size,
             batch_size=batch_size,
             tau=0.005,
-            gamma=0.99,
+            gamma=args.gamma,
             ent_coef=ent_coef,
             train_freq=1,
             gradient_steps=args.gradient_steps,
@@ -1397,7 +1437,8 @@ def main():
         verbose=1,
     )
 
-    callbacks = [eval_callback]
+    reward_logger = RewardComponentLogger(log_every=100)
+    callbacks = [eval_callback, reward_logger]
 
     if wandb_run is not None:
         wandb_callback = WandbCallback(
